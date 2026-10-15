@@ -84,15 +84,19 @@ public class PhicommInitializeHandler extends ANTEventDispatcher implements Phic
                 @Override // com.unisound.vui.common.media.IMediaPlayerStateListener
                 public void onPlayerState(int state, String tag) {
                     if (state == 4) {
-                        PhicommInitializeHandler.this.isFristBoot = true;
+                        // 修复: PhicommChatHandler 会吃掉 onTTSEventPlayingEnd, 这里收不到,
+                        // 若依赖 TTS 结束回调, 开机没网时唤醒永远不恢复。改为不停唤醒、直接初始化。
+                        PhicommInitializeHandler.this.isFristBoot = false;
                         if (UserPerferenceUtil.getDeviceBindState(PhicommInitializeHandler.this.mContext)) {
                             PhicommInitializeHandler.this.mANTEngine.playTTS(PhicommInitializeHandler.this.mContext.getString(R.string.tts_net_is_weak));
                         } else {
                             PhicommInitializeHandler.this.mANTEngine.playTTS(PhicommInitializeHandler.this.mContext.getString(R.string.tts_bootloader_welcome));
                         }
                         UniMediaPlayer.getInstance().removeIMediaPlayerStateListener(this);
+                        initPhicommBusiness();
                     } else if (state == 3) {
                         UniMediaPlayer.getInstance().removeIMediaPlayerStateListener(this);
+                        initPhicommBusiness();
                     }
                 }
             }, false);
