@@ -390,6 +390,15 @@ public class NetEaseMusicClient {
 
     /** 给一首候选解出可播直链; 无版权(11 秒提示音)或失败返回 null。 */
     public String kuwoResolve(MusicSearchResult c) {
+        // 先试无损: 酷我车机 FLAC -> GD 台网易云 FLAC/320k; 都不行再走原来的酷我标准 MP3
+        if (losslessEnabled) {
+            try {
+                String hq = lossless.resolve(c.id, c.name, c.artist);
+                if (hq != null) return hq;
+            } catch (Throwable t) {
+                LogMgr.e(TAG, "lossless error: " + t);
+            }
+        }
         String url = httpGet(KUWO_URL + c.id, 2);
         if (url == null) return null;
         url = url.trim();
@@ -403,8 +412,13 @@ public class NetEaseMusicClient {
             return null;
         }
         if (url.startsWith("https://")) url = "http://" + url.substring(8);
+        LogMgr.d(TAG, "resolved src=kuwo-anti q=mp3(standard): " + c.name);
         return url;
     }
+
+    private final LosslessResolver lossless = new LosslessResolver();
+    /** 无损开关: 设备带宽/解码出问题时可改 false 回到纯 MP3 */
+    public static volatile boolean losslessEnabled = true;
 
     public static MusicPlayResult toPlay(MusicSearchResult c, String url) {
         MusicPlayResult res = new MusicPlayResult();
