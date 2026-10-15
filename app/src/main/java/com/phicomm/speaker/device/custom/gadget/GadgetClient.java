@@ -47,7 +47,17 @@ public final class GadgetClient {
     private static final String WS_KEY = "dGhlIHNhbXBsZSBub25jZQ==";
 
     private static final long REPLY_TIMEOUT_MS = 60_000;
-    private static final long SETTLE_QUIET_MS = 2_500;
+    private static final long SETTLE_QUIET_MS = 600;   // 收到 message_done 后只再听 0.6 秒
+    private static final long KEEPALIVE_MS = 25_000;
+
+    /** 首轮随人设一起发的儿童规则(每条连接只发一次, 之后靠 Muse 自己的会话记忆) */
+    private static final String KID_RULES =
+            "你是家里智能音箱里的小伙伴, 正在和一个小朋友说话。"
+            + "回答用 3 句话以内, 口语化, 不用列表、符号、表情和英文缩写, 方便直接朗读。"
+            + "只聊天和讲知识/故事, 不执行任何操作或工具, 不讲吓人、暴力、不适合儿童的内容。";
+    private boolean personaSent = false;
+    private Thread keepAliveThread;
+    private volatile boolean keepAliveRunning = false;
 
     private final String sdkToken;          // legacy, only when creds == null
     private final DeviceCredentials creds;  // from Muse BLE pairing (preferred)
@@ -207,6 +217,7 @@ public final class GadgetClient {
         log("Noise XX handshake done");
         nextStream = 1;
         subBuf.reset();
+        personaSent = false;
         if (creds != null) registerDevice();
         subStream = openStream("POST", "/chat/subscribe",
                 new String[]{"Content-Type", "application/json", "Accept", "application/x-ndjson",
@@ -263,13 +274,15 @@ public final class GadgetClient {
         if (sock == null || noise == null) {
             connect();   // first turn (PhicommChatHandler only news the client)
         }
+        // Muse 服务端自己保存会话上下文, 不再每轮重发人设和历史(提示词越长它想得越久)。
+        // 只在每条新连接的第一轮带上儿童规则 + 人设; historyText 不再使用。
         StringBuilder sb = new StringBuilder();
-        if (systemPrompt != null && !systemPrompt.isEmpty())
-            sb.append(systemPrompt).append("\n\n");
-        if (historyText != null && !historyText.isEmpty()) {
-            String h = historyText.length() > 1500
-                    ? historyText.substring(historyText.length() - 1500) : historyText;
-            sb.append(h).append("\n\n");
+        boolean withPersona = !personaSent;
+        if (withPersona) {
+            sb.append(KID_RULES).append("\n");
+            if (systemPrompt != null && !systemPrompt.isEmpty())
+                sb.append(systemPrompt).append("\n");
+            sb.append("\n小朋友说: ");
         }
         sb.append(userInput);
         JSONObject req = new JSONObject()
@@ -279,11 +292,23 @@ public final class GadgetClient {
         byte[] body = req.toString().getBytes(StandardCharsets.UTF_8);
         subBuf.reset();  // drop any late events from the previous turn
         try {
-            return doChat(body);
+            String r = doChat(body);
+            if (withPersona) personaSent = true;
+            return r;
         } catch (Exception e) {
+            log("chat failed, reconnect once: " + e);
             connect();           // one reconnect attempt (covers IO + protocol errors)
             subBuf.reset();
-            return doChat(body);
+            {   // 新连接 = 新会话: 重新带上人设
+                StringBuilder sb2 = new StringBuilder(KID_RULES).append("\n");
+                if (systemPrompt != null && !systemPrompt.isEmpty()) sb2.append(systemPrompt).append("\n");
+                sb2.append("\n小朋友说: ").append(userInput);
+                req.put("message", sb2.toString());
+                body = req.toString().getBytes(StandardCharsets.UTF_8);
+            }
+            String r = doChat(body);
+            personaSent = true;
+            return r;
         }
     }
 
@@ -304,7 +329,9 @@ public final class GadgetClient {
             // Return whatever text arrived (may be partial or empty).
             if (now >= deadline) break;
             if (inTurn && quietUntil > 0 && now >= quietUntil) break;
-            sock.setSoTimeout((int) Math.max(500, Math.min(5_000, deadline - now)));
+            long wait = Math.min(5_000, deadline - now);
+            if (inTurn && quietUntil > 0) wait = Math.min(wait, quietUntil - now);
+            sock.setSoTimeout((int) Math.max(100, wait));
             byte[] frame;
             try {
                 frame = wsRecv();
@@ -415,6 +442,86 @@ public final class GadgetClient {
         return out.toString().trim();
     }
 
+    // ---------------- warm-up / keep-alive ----------------
+    /**
+     * 开机后台调用: 提前连好 Muse, 之后每 25 秒发一次 WS ping 并把空闲期间服务器推来的
+     * 事件读掉(必须按顺序解密, 否则 Noise nonce 会错位)。连接断了就重连, 顺便按时刷新令牌。
+     * 这样问话时不用再花 ~10 秒建连。
+     */
+    public synchronized void startKeepAlive() {
+        if (keepAliveThread != null) return;
+        keepAliveRunning = true;
+        keepAliveThread = new Thread(new Runnable() {
+            @Override
+            public void run() {
+                long backoff = 5_000;
+                while (keepAliveRunning) {
+                    boolean ok = tick();
+                    long sleep = ok ? KEEPALIVE_MS : backoff;
+                    backoff = ok ? 5_000 : Math.min(backoff * 2, 300_000);
+                    try {
+                        Thread.sleep(sleep);
+                    } catch (InterruptedException e) {
+                        return;
+                    }
+                }
+            }
+        }, "GadgetKeepAlive");
+        keepAliveThread.setDaemon(true);
+        keepAliveThread.start();
+    }
+
+    private synchronized boolean tick() {
+        try {
+            if (creds != null) creds.refreshIfDue();
+            if (sock == null || noise == null) {
+                long t0 = System.currentTimeMillis();
+                connect();
+                log("warm connect ok in " + (System.currentTimeMillis() - t0) + " ms");
+                return true;
+            }
+            wsPing();
+            drainIdle();
+            return true;
+        } catch (Exception e) {
+            log("keep-alive failed, will reconnect: " + e);
+            close();
+            return false;
+        }
+    }
+
+    private void wsPing() throws IOException {
+        byte[] m = new byte[4];
+        maskRnd.nextBytes(m);
+        out.write(new byte[]{(byte) 0x89, (byte) 0x80, m[0], m[1], m[2], m[3]});
+        out.flush();
+    }
+
+    /** 读掉空闲期间的帧(解密以保持 nonce 同步), 内容丢弃。 */
+    private void drainIdle() throws Exception {
+        sock.setSoTimeout(500);
+        while (true) {
+            byte[] frame;
+            try {
+                frame = wsRecv();
+            } catch (java.net.SocketTimeoutException e) {
+                break;
+            }
+            byte[] plain = noise.decrypt(frame);
+            try {
+                byte[] whole = reasm.feed(plain);
+                if (whole != null) {
+                    GadgetProto.ServerFrame sf = GadgetProto.decodeServiceResponse(whole);
+                    if (sf.isReset && (sf.streamId == subStream || sf.streamId == controlStream))
+                        throw new IOException("stream " + sf.streamId + " reset while idle");
+                }
+            } catch (IllegalArgumentException ignored) {
+            }
+            sock.setSoTimeout(300);
+        }
+        subBuf.reset();
+    }
+
     public synchronized void close() {
         try {
             if (sock != null) sock.close();
@@ -488,6 +595,7 @@ public final class GadgetClient {
                 out.flush();
                 continue;
             }
+            if (opcode == 0xA) continue;  // pong (answer to our keep-alive ping)
             if (opcode == 0x2 || opcode == 0x0) msg.write(data, 0, data.length);
             if (fin) return msg.toByteArray();
         }
