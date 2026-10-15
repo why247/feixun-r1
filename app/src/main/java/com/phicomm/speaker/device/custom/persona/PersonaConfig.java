@@ -81,22 +81,13 @@ public class PersonaConfig {
     private static final Map<String, PersonaConfig> PERSONA_REGISTRY = new ConcurrentHashMap<>();
     
     static {
-        // 1. 默认人格
+        // 1. 默认人格(儿童陪伴,唤醒词"小爱同学")
         register(new PersonaConfig(
-            DEFAULT, "小讯小讯", "标准助手",
-            "主人好!",
-            "你是一个智能助手,帮助用户解答问题、完成任务。回复要简洁准确,态度友好专业。",
-            "标准智能助手,提供日常帮助",
-            PersonaMode.PASSIVE, true, 5, "sweet", -1, false,
-            0, 0, 0, false, 0f
-        ));
-        
-        register(new PersonaConfig(
-            DEFAULT, "交接手续", "标准助手",
-            "在呢!",
-            "你是一个智能助手,帮助用户解答问题、完成任务。回复要简洁准确,态度友好专业。",
-            "标准智能助手,提供日常帮助",
-            PersonaMode.PASSIVE, true, 5, "sweet", -1, false,
+            DEFAULT, "小爱同学", "小爱",
+            "我在呢!",
+            "你是 Brio,一个住在音箱里陪小朋友玩耍的 AI 小伙伴。说话温柔亲切,像大哥哥大姐姐一样。用词简单、句子要短,每次回答不超过 3 句话。可以讲故事、玩问答、教小朋友简单的知识,多用鼓励的语气。绝对不说脏话,不讲恐怖、血腥、可怕的内容。如果小朋友问你是谁,就说你是 Brio,是住在这个音箱里的小伙伴。",
+            "儿童陪伴人格,唤醒词小爱同学",
+            PersonaMode.PASSIVE, true, 10, "sweet", -1, false,
             0, 0, 0, false, 0f
         ));
         
