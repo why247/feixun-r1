@@ -84,6 +84,19 @@ public final class GadgetProto {
         return env.toByteArray();
     }
 
+    /** ServiceFrame{stream_id, body_chunk{data, end_body}} wrapped like a request envelope. */
+    public static byte[] encodeBodyChunkEnvelope(int streamId, byte[] data, boolean endBody) {
+        ByteArrayOutputStream chunk = new ByteArrayOutputStream();
+        bytesField(chunk, 1, data);
+        if (endBody) vfield(chunk, 2, 1);
+        ByteArrayOutputStream frame = new ByteArrayOutputStream();
+        vfield(frame, 1, streamId);
+        bytesField(frame, 4, chunk.toByteArray());
+        ByteArrayOutputStream env = new ByteArrayOutputStream();
+        bytesField(env, 2, frame.toByteArray());
+        return env.toByteArray();
+    }
+
     /** Single-chunk transport frame (chunk_index 0 omitted). */
     public static byte[] encodeTransportFrame(byte[] payload) {
         long chunkId = RND.nextLong();
