@@ -13,6 +13,7 @@ import java.util.List;
 import javax.net.ssl.SSLSocket;
 import javax.net.ssl.SSLSocketFactory;
 import org.json.JSONArray;
+import org.json.JSONException;
 import org.json.JSONObject;
 
 /**
@@ -55,6 +56,14 @@ public final class GadgetClient {
     }
 
     private VmInfo fetchVms() throws IOException {
+        try {
+            return fetchVmsInner();
+        } catch (JSONException e) {
+            throw new IOException("fetch_vms: bad JSON: " + e.getMessage());
+        }
+    }
+
+    private VmInfo fetchVmsInner() throws IOException, JSONException {
         SSLSocketFactory f = (SSLSocketFactory) SSLSocketFactory.getDefault();
         try (SSLSocket s = (SSLSocket) f.createSocket(FETCH_HOST, 443)) {
             s.setSoTimeout(15_000);
