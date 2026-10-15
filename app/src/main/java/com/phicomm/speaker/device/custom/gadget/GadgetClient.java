@@ -29,6 +29,18 @@ import org.json.JSONObject;
  * Only java.net / javax.net.ssl / org.json (already in the app).
  */
 public final class GadgetClient {
+    private static final String TAG = "Gadget";
+    private static void log(String m) {
+        try { android.util.Log.d(TAG, m); } catch (Throwable t) { System.out.println(TAG + ": " + m); }
+    }
+    private static String preview(byte[] b) {
+        if (b == null) return "null";
+        String t = new String(b, 0, Math.min(b.length, 300), StandardCharsets.UTF_8);
+        return t.replaceAll("[\\r\\n]+", " ") + (b.length > 300 ? "...(" + b.length + "B)" : "");
+    }
+    private final GadgetProto.Reassembler reasm = new GadgetProto.Reassembler();
+    private int controlStream = -1;
+    private int chatStream = -1;
     private static final String FETCH_HOST = "api.muse.ai";
     private static final String VM_HOST = "hatch.metaaivm.com";
     private static final int VM_PORT = 443;
@@ -119,8 +131,10 @@ public final class GadgetClient {
             byte[] body = readAll(s.getInputStream());
             if (status == 401 || status == 403)
                 throw new TokenRejected("token rejected (HTTP " + status + ")");
-            if (status != 200)
+            if (status != 200) {
+                log("fetch_vms HTTP " + status + " body=" + preview(body));
                 throw new IOException("fetch_vms failed (HTTP " + status + ")");
+            }
             JSONObject root = new JSONObject(new String(body, StandardCharsets.UTF_8));
             JSONArray list = root.optJSONArray("vm_list");
             if (list == null || list.length() == 0)
@@ -143,6 +157,7 @@ public final class GadgetClient {
             vm.vmToken = pick.getString("vm_auth_token");
             if (vm.vmId.isEmpty() || vm.vmToken.isEmpty())
                 throw new IOException("bad VM entry");
+            log("fetch_vms OK: " + list.length() + " VM(s), using " + vm.vmName);
             return vm;
         }
     }
@@ -183,11 +198,13 @@ public final class GadgetClient {
             throw new IOException("VM refused the token (HTTP " + status + ")");
         if (status != 101)
             throw new IOException("WS upgrade failed (HTTP " + status + ")");
+        log("WS upgraded to " + vmHost());
 
         noise = new NoiseXX();
         wsSend(noise.writeMessage1());
         noise.readMessage2(wsRecv());
         wsSend(noise.writeMessage3(new byte[0]));
+        log("Noise XX handshake done");
         nextStream = 1;
         subBuf.reset();
         if (creds != null) registerDevice();
@@ -199,7 +216,7 @@ public final class GadgetClient {
 
     /** Control stream + link.register, so chat turns are attributed to this paired device. */
     private void registerDevice() throws Exception {
-        int sid = openStream("POST", "/link-control",
+        int sid = controlStream = openStream("POST", "/link-control",
                 new String[]{"x-app-id", "musegadget"}, new byte[0], false);
         JSONObject params = new JSONObject()
                 .put("node_id", creds.nodeId())
@@ -224,6 +241,7 @@ public final class GadgetClient {
         System.arraycopy(msg, 0, framed, 4, msg.length);
         byte[] env = GadgetProto.encodeBodyChunkEnvelope(sid, framed, false);
         wsSend(noise.encrypt(GadgetProto.encodeTransportFrame(env)));
+        log("sent link.register as " + creds.nodeId());
     }
 
     private int openStream(String verb, String path, String[] headers,
@@ -270,7 +288,7 @@ public final class GadgetClient {
     }
 
     private String doChat(byte[] body) throws Exception {
-        openStream("POST", "/chat/stream",
+        chatStream = openStream("POST", "/chat/stream",
                 new String[]{"Content-Type", "application/json",
                         "x-request-id", java.util.UUID.randomUUID().toString(),
                         "x-app-id", "musegadget"}, body, true);
@@ -297,15 +315,40 @@ public final class GadgetClient {
             try {
                 plain = noise.decrypt(frame);
             } catch (Exception e) {
-                continue;
+                log("decrypt failed: " + e);
+                throw new IOException("noise decrypt failed", e);  // nonce out of sync -> reconnect
             }
             GadgetProto.ServerFrame sf;
             try {
-                sf = GadgetProto.decodeServerFrame(plain);
+                byte[] whole = reasm.feed(plain);
+                if (whole == null) continue;          // more chunks pending
+                sf = GadgetProto.decodeServiceResponse(whole);
             } catch (IllegalArgumentException e) {
+                log("bad frame: " + e.getMessage());
                 continue;
             }
-            if (sf.streamId != subStream || sf.isResponse) continue;
+            if (sf.streamId == controlStream) {
+                log("control: " + (sf.isResponse ? "resp " + sf.status + " " : "")
+                        + preview(sf.body));
+                continue;
+            }
+            if (sf.streamId == chatStream) {
+                if (sf.isReset) throw new IOException("chat stream reset by server");
+                if (sf.isResponse) {
+                    log("chat/stream HTTP " + sf.status + " " + preview(sf.body));
+                    if (sf.status >= 400) throw new IOException("chat/stream HTTP " + sf.status);
+                }
+                continue;
+            }
+            if (sf.streamId != subStream) {
+                log("frame for unknown stream " + sf.streamId);
+                continue;
+            }
+            if (sf.isReset) throw new IOException("subscribe stream reset by server");
+            if (sf.isResponse) {
+                log("subscribe HTTP " + sf.status);
+                if (sf.status >= 400) throw new IOException("subscribe HTTP " + sf.status);
+            }
             subBuf.write(sf.body, 0, sf.body.length);
             byte[] buf = subBuf.toByteArray();
             int start = 0;
@@ -324,6 +367,8 @@ public final class GadgetClient {
                     String name = ev.optString("event", "");
                     JSONObject payload = ev.optJSONObject("payload");
                     if (payload == null) payload = new JSONObject();
+                    log("event " + name);
+                    if ("user".equals(payload.optString("role", ""))) continue;
                     if ("delta.text_append".equals(name)) {
                         String t = payload.optString("text", "");
                         if (!t.isEmpty()) {
@@ -334,7 +379,20 @@ public final class GadgetClient {
                     } else if ("delta.message_done".equals(name)
                             || "message.assistant".equals(name)) {
                         String txt = payload.optString("display_text", "");
-                        if (txt.isEmpty()) txt = payload.optString("content", "");
+                        if (txt.isEmpty()) {
+                            JSONArray items = payload.optJSONArray("content");
+                            if (items != null) {
+                                StringBuilder t = new StringBuilder();
+                                for (int k = 0; k < items.length(); k++) {
+                                    JSONObject it = items.optJSONObject(k);
+                                    if (it != null && "text".equals(it.optString("type")))
+                                        t.append(it.optString("text", ""));
+                                }
+                                txt = t.toString();
+                            } else {
+                                txt = payload.optString("content", "");
+                            }
+                        }
                         String full = cur.length() > 0 ? cur.toString() : txt;
                         if (!full.trim().isEmpty()) messages.add(full);
                         cur.setLength(0);
