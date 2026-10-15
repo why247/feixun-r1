@@ -103,12 +103,17 @@ def build_janus_v2(original_apk_path, dex_path, output_path):
         print(f"[VERIFY] DEX file_size: {fs}, checksum: 0x{chk:08x}")
     
     # Verify ZIP
-    import subprocess
-    result = subprocess.run(['unzip', '-t', output_path], capture_output=True, text=True)
-    if result.returncode == 0:
-        print(f"[VERIFY] ZIP structure OK")
-    else:
-        print(f"[WARN] ZIP test failed: {result.stderr[:100]}")
+    # 用 Python 自带 zipfile 校验 (Windows 没有 unzip 命令)
+    import zipfile
+    try:
+        with zipfile.ZipFile(output_path) as zf:
+            bad = zf.testzip()
+        if bad is None:
+            print(f"[VERIFY] ZIP structure OK")
+        else:
+            print(f"[WARN] ZIP test failed at: {bad}")
+    except Exception as e:
+        print(f"[WARN] ZIP test failed: {e}")
     
     print(f"[SUCCESS] Janus v2 APK: {output_path} ({len(apk)} bytes)")
 

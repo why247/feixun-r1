@@ -22,3 +22,7 @@ __pycache__/
 # 复制 ai_config.example.ini 为 ai_config.local.ini 后填入你自己的 Key
 ai_config.local.ini
 *.local.ini
+
+# build_from_java.py
+tools/
+build_out/

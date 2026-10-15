@@ -7,7 +7,6 @@ import android.os.StrictMode;
 import android.text.TextUtils;
 import com.google.gson.reflect.TypeToken;
 import com.phicomm.speaker.device.R;
-import com.phicomm.speaker.device.utils.PhicommUtils;
 import com.unisound.vui.common.config.ANTConfigPreference;
 import com.unisound.vui.common.network.NetUtil;
 import com.unisound.vui.engine.ANTHandlerContext;
