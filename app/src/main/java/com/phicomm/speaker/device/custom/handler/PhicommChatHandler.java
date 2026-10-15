@@ -134,10 +134,20 @@ public class PhicommChatHandler extends SimpleUserEventInboundHandler<NLU> {
         this.openAIClient = new OpenAIClient(config);
 
         // Gadget 直连: gadget_token 非空即启用, 直连 Brio; 失败时回落 OpenAI 池
+        // 优先用 Muse 蓝牙配对得到的设备凭证 (files/muse_pairing.json + muse_identity.json)
+        com.phicomm.speaker.device.custom.gadget.DeviceCredentials creds =
+                com.phicomm.speaker.device.custom.gadget.DeviceCredentials.load(context.getFilesDir());
         String gadgetToken = config.getGadgetToken();
-        this.useGadget = gadgetToken != null && !gadgetToken.isEmpty();
-        if (this.useGadget) {
-            this.gadgetClient = new GadgetClient(gadgetToken);
+        if (creds != null) {
+            this.useGadget = true;
+            this.gadgetClient = new GadgetClient(creds);
+            LogMgr.d(TAG, "Gadget: device credentials loaded, node=" + creds.nodeId());
+        } else {
+            this.useGadget = gadgetToken != null && !gadgetToken.isEmpty();
+            if (this.useGadget) {
+                this.gadgetClient = new GadgetClient(gadgetToken);
+            }
+            LogMgr.d(TAG, "Gadget: no device credentials, useGadget=" + this.useGadget);
         }
         
         LogMgr.d(TAG, "PhicommChatHandler initialized with model: " + config.getModel());
