@@ -37,7 +37,8 @@ public final class GadgetClient {
     private static final long REPLY_TIMEOUT_MS = 60_000;
     private static final long SETTLE_QUIET_MS = 2_500;
 
-    private final String sdkToken;
+    private final String sdkToken;          // legacy, only when creds == null
+    private final DeviceCredentials creds;  // from Muse BLE pairing (preferred)
     private Socket sock;
     private InputStream in;
     private OutputStream out;
@@ -48,6 +49,34 @@ public final class GadgetClient {
 
     public GadgetClient(String sdkToken) {
         this.sdkToken = sdkToken;
+        this.creds = null;
+    }
+
+    public GadgetClient(DeviceCredentials creds) {
+        this.sdkToken = null;
+        this.creds = creds;
+    }
+
+    private String apiHost() {
+        if (creds == null) return FETCH_HOST;
+        String r = creds.apiRoot().substring("https://".length());
+        int slash = r.indexOf('/');
+        return slash >= 0 ? r.substring(0, slash) : r;
+    }
+
+    private String apiPrefix() {
+        if (creds == null) return "";
+        String r = creds.apiRoot().substring("https://".length());
+        int slash = r.indexOf('/');
+        return slash >= 0 ? r.substring(slash) : "";
+    }
+
+    private String vmHost() {
+        return creds == null ? VM_HOST : creds.noiseHost();
+    }
+
+    private String bearer() {
+        return creds == null ? sdkToken : creds.accessToken();
     }
 
     // ---------------- fetch_vms ----------------
@@ -57,19 +86,30 @@ public final class GadgetClient {
 
     private VmInfo fetchVms() throws IOException {
         try {
-            return fetchVmsInner();
+            if (creds != null) creds.refreshIfDue();
+            try {
+                return fetchVmsInner();
+            } catch (TokenRejected e) {
+                if (creds == null) throw e;
+                creds.refresh();          // rotates + persists both tokens
+                return fetchVmsInner();
+            }
         } catch (JSONException e) {
             throw new IOException("fetch_vms: bad JSON: " + e.getMessage());
         }
     }
 
+    private static final class TokenRejected extends IOException {
+        TokenRejected(String m) { super(m); }
+    }
+
     private VmInfo fetchVmsInner() throws IOException, JSONException {
         SSLSocketFactory f = (SSLSocketFactory) SSLSocketFactory.getDefault();
-        try (SSLSocket s = (SSLSocket) f.createSocket(FETCH_HOST, 443)) {
+        try (SSLSocket s = (SSLSocket) f.createSocket(apiHost(), 443)) {
             s.setSoTimeout(15_000);
-            String req = "GET /fetch_vms HTTP/1.0\r\n"
-                    + "Host: " + FETCH_HOST + "\r\n"
-                    + "Authorization: Bearer " + sdkToken + "\r\n"
+            String req = "GET " + apiPrefix() + "/fetch_vms HTTP/1.0\r\n"
+                    + "Host: " + apiHost() + "\r\n"
+                    + "Authorization: Bearer " + bearer() + "\r\n"
                     + "X-API-Version: 1.0.0\r\n"
                     + "Connection: close\r\n\r\n";
             s.getOutputStream().write(req.getBytes(StandardCharsets.US_ASCII));
@@ -78,7 +118,7 @@ public final class GadgetClient {
             int status = parseStatus(head);
             byte[] body = readAll(s.getInputStream());
             if (status == 401 || status == 403)
-                throw new IOException("token rejected (HTTP " + status + ")");
+                throw new TokenRejected("token rejected (HTTP " + status + ")");
             if (status != 200)
                 throw new IOException("fetch_vms failed (HTTP " + status + ")");
             JSONObject root = new JSONObject(new String(body, StandardCharsets.UTF_8));
@@ -122,7 +162,7 @@ public final class GadgetClient {
         close();
         VmInfo vm = fetchVms();
         SSLSocketFactory f = (SSLSocketFactory) SSLSocketFactory.getDefault();
-        SSLSocket s = (SSLSocket) f.createSocket(VM_HOST, VM_PORT);
+        SSLSocket s = (SSLSocket) f.createSocket(vmHost(), VM_PORT);
         s.setSoTimeout(15_000);
         sock = s;
         in = s.getInputStream();
@@ -130,7 +170,7 @@ public final class GadgetClient {
 
         String path = "/v1/noise?vm_id=" + URLEncoder.encode(vm.vmId, "UTF-8");
         String req = "GET " + path + " HTTP/1.1\r\n"
-                + "Host: " + VM_HOST + "\r\n"
+                + "Host: " + vmHost() + "\r\n"
                 + "Authorization: Bearer " + vm.vmToken + "\r\n"
                 + "Upgrade: websocket\r\n"
                 + "Connection: Upgrade\r\n"
@@ -150,9 +190,40 @@ public final class GadgetClient {
         wsSend(noise.writeMessage3(new byte[0]));
         nextStream = 1;
         subBuf.reset();
+        if (creds != null) registerDevice();
         subStream = openStream("POST", "/chat/subscribe",
-                new String[]{"Content-Type", "application/json", "Accept", "application/x-ndjson"},
+                new String[]{"Content-Type", "application/json", "Accept", "application/x-ndjson",
+                        "x-app-id", "musegadget"},
                 "{}".getBytes(StandardCharsets.UTF_8), true);
+    }
+
+    /** Control stream + link.register, so chat turns are attributed to this paired device. */
+    private void registerDevice() throws Exception {
+        int sid = openStream("POST", "/link-control",
+                new String[]{"x-app-id", "musegadget"}, new byte[0], false);
+        JSONObject params = new JSONObject()
+                .put("node_id", creds.nodeId())
+                .put("display_name", "Phicomm R1")
+                .put("platform", "linux")
+                .put("version", "0.1.0")
+                .put("device_family", "homehub")
+                .put("model_id", "linux")
+                .put("is_wakeup_supported", false)
+                .put("commands_v2", new JSONObject());
+        byte[] msg = new JSONObject()
+                .put("type", "req")
+                .put("id", java.util.UUID.randomUUID().toString())
+                .put("method", "link.register")
+                .put("params", params)
+                .toString().getBytes(StandardCharsets.UTF_8);
+        byte[] framed = new byte[4 + msg.length];
+        framed[0] = (byte) msg.length;
+        framed[1] = (byte) (msg.length >>> 8);
+        framed[2] = (byte) (msg.length >>> 16);
+        framed[3] = (byte) (msg.length >>> 24);   // little-endian u32 length prefix
+        System.arraycopy(msg, 0, framed, 4, msg.length);
+        byte[] env = GadgetProto.encodeBodyChunkEnvelope(sid, framed, false);
+        wsSend(noise.encrypt(GadgetProto.encodeTransportFrame(env)));
     }
 
     private int openStream(String verb, String path, String[] headers,
@@ -183,10 +254,11 @@ public final class GadgetClient {
             sb.append(h).append("\n\n");
         }
         sb.append(userInput);
-        byte[] body = new JSONObject()
+        JSONObject req = new JSONObject()
                 .put("message", sb.toString())
-                .put("output_modality", "text")
-                .toString().getBytes(StandardCharsets.UTF_8);
+                .put("output_modality", "text");
+        if (creds != null) req.put("device_id", creds.nodeId());
+        byte[] body = req.toString().getBytes(StandardCharsets.UTF_8);
         subBuf.reset();  // drop any late events from the previous turn
         try {
             return doChat(body);
@@ -199,7 +271,9 @@ public final class GadgetClient {
 
     private String doChat(byte[] body) throws Exception {
         openStream("POST", "/chat/stream",
-                new String[]{"Content-Type", "application/json"}, body, true);
+                new String[]{"Content-Type", "application/json",
+                        "x-request-id", java.util.UUID.randomUUID().toString(),
+                        "x-app-id", "musegadget"}, body, true);
         long deadline = System.currentTimeMillis() + REPLY_TIMEOUT_MS;
         List<String> messages = new ArrayList<>();
         StringBuilder cur = new StringBuilder();
