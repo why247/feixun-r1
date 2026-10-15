@@ -80,7 +80,7 @@ public final class X25519 {
             BigInteger tmp = x2; x2 = x3; x3 = tmp;
             tmp = z2; z2 = z3; z3 = tmp;
         }
-        BigInteger z2inv = z2.modPow(P.subtract(BigInteger.TWO), P);
+        BigInteger z2inv = z2.modPow(P.subtract(BigInteger.valueOf(2)), P);
         return bigToLe(x2.multiply(z2inv).mod(P));
     }
 

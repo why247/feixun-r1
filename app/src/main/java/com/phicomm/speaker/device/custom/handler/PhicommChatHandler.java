@@ -245,7 +245,7 @@ public class PhicommChatHandler extends SimpleUserEventInboundHandler<NLU> {
             public void run() {
                 isProcessingRequest = true;  // ⭐ 标记任务开始
                 try {
-                    String response;
+                    String response = null;
                     // v87: 豆包链可能随回复带回这条回答的语音(mp3), 有就用豆包自己的声音播
                     byte[] llmAudio = null;
                     String llmAudioFormat = null;
