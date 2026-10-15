@@ -6,6 +6,7 @@ import android.os.Looper;
 
 import com.phicomm.speaker.device.custom.ai.ConversationHistory;
 import com.phicomm.speaker.device.custom.ai.OpenAIClient;
+import com.phicomm.speaker.device.custom.gadget.GadgetClient;
 import com.phicomm.speaker.device.custom.ai.PersonaConversationManager;
 import com.phicomm.speaker.device.custom.config.AIConfig;
 import com.phicomm.speaker.device.custom.tts.DoubaoVoicePlayer;
@@ -75,6 +76,10 @@ public class PhicommChatHandler extends SimpleUserEventInboundHandler<NLU> {
     
     // AI 客户端
     private OpenAIClient openAIClient;
+
+    // Gadget 直连: api_key 以 mgst_ 开头时启用, 直连 Brio(不用 OpenAI 池)
+    private GadgetClient gadgetClient;
+    private boolean useGadget = false;
     
     // 当前大模型回复(用于打断处理)
     private String currentResponse;
@@ -127,6 +132,13 @@ public class PhicommChatHandler extends SimpleUserEventInboundHandler<NLU> {
         Context context = ctx.androidContext();
         AIConfig config = AIConfig.load(context);
         this.openAIClient = new OpenAIClient(config);
+
+        // Gadget 直连: api_key 填 SDK token(mgst_...) 即直连 Brio, 不走 OpenAI 池
+        String gadgetKey = config.getApiKey();
+        this.useGadget = gadgetKey != null && gadgetKey.trim().startsWith("mgst_");
+        if (this.useGadget) {
+            this.gadgetClient = new GadgetClient(gadgetKey.trim());
+        }
         
         LogMgr.d(TAG, "PhicommChatHandler initialized with model: " + config.getModel());
         return super.onASREventEngineInitDone(ctx);
@@ -399,11 +411,23 @@ public class PhicommChatHandler extends SimpleUserEventInboundHandler<NLU> {
                                     + " hist_turns=" + personaHistory.size());
 
                             // 调用带 persona systemPrompt + 该 persona 历史
-                            OpenAIClient.Reply r = openAIClient.chatWithHistoryEx(
-                                    userInput, historyText, activeSysPrompt, null);
-                            response = (r == null) ? null : r.text;
-                            llmAudio = (r == null) ? null : r.audio;
-                            llmAudioFormat = (r == null) ? null : r.audioFormat;
+                            if (useGadget && gadgetClient != null) {
+                                // Gadget 直连 Brio: 只回文字, 走原厂 TTS 播放
+                                try {
+                                    response = gadgetClient.chat(activeSysPrompt, userInput);
+                                } catch (Exception ge) {
+                                    LogMgr.e(TAG, "Gadget 直连失败: " + ge);
+                                    response = null;
+                                }
+                                llmAudio = null;
+                                llmAudioFormat = null;
+                            } else {
+                                OpenAIClient.Reply r = openAIClient.chatWithHistoryEx(
+                                        userInput, historyText, activeSysPrompt, null);
+                                response = (r == null) ? null : r.text;
+                                llmAudio = (r == null) ? null : r.audio;
+                                llmAudioFormat = (r == null) ? null : r.audioFormat;
+                            }
 
                             LogMgr.d(TAG, "大模型返回: " + response);
                             LogMgr.d(TAG, "随回复带回的语音: "
