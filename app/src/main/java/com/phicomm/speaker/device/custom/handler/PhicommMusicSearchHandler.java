@@ -45,6 +45,16 @@ public class PhicommMusicSearchHandler extends SimpleUserEventInboundHandler<NLU
     
     // 是否正在播放音乐
     private boolean isPlaying = false;
+
+    // ── 连播队列 ──
+    // 搜到的其余候选, 一首播完自动下一首; 被唤醒打断后保留 5 分钟, 可以说「下一首」继续。
+    private final java.util.LinkedList<NetEaseMusicClient.MusicSearchResult> queue =
+            new java.util.LinkedList<NetEaseMusicClient.MusicSearchResult>();
+    private long queueKeptUntil = 0;
+    private volatile int playGen = 0;
+    private boolean listenerAdded = false;
+    private static final String[] NEXT_WORDS = {"下一首", "换一首", "下一个", "换一个", "切歌", "下首"};
+    private static final int MAX_QUEUE = 15;
     
     public PhicommMusicSearchHandler() {
         this.sessionName = SessionRegister.SESSION_MUSIC;
@@ -69,6 +79,12 @@ public class PhicommMusicSearchHandler extends SimpleUserEventInboundHandler<NLU
         boolean isMusic = "cn.yunzhisheng.music".equals(service);
         boolean isSettingMp = "cn.yunzhisheng.setting.mp".equals(service);
         
+        // 「下一首」: 有连播队列时由这里接管
+        if (text != null && isNextIntent(text) && hasQueue()) {
+            LogMgr.d(TAG, "acceptInboundEvent0: next intent with queue: " + text);
+            return true;
+        }
+
         // music 和 setting.mp 直接拦截
         if (isMusic || isSettingMp) {
             LogMgr.d(TAG, "acceptInboundEvent0: service=" + service + ", text=" + text + ", accept=true");
@@ -142,7 +158,19 @@ public class PhicommMusicSearchHandler extends SimpleUserEventInboundHandler<NLU
     @Override
     public void eventReceived(final NLU evt, final ANTHandlerContext ctx) throws Exception {
         super.eventReceived(evt, ctx);
-        
+
+        String raw = null;
+        try { raw = evt.getText(); } catch (Throwable ignored) { }
+        if (raw != null && isNextIntent(raw) && hasQueue()) {
+            new Thread(new Runnable() {
+                @Override
+                public void run() {
+                    playNextAnnounced(ctx);
+                }
+            }).start();
+            return;
+        }
+
         // 解析关键词
         String keyword = parseKeyword(evt);
         LogMgr.d(TAG, "music search keyword: " + keyword);
@@ -221,8 +249,30 @@ public class PhicommMusicSearchHandler extends SimpleUserEventInboundHandler<NLU
         LogMgr.d(TAG, "searchAndPlay: " + keyword);
         
         try {
-            // 搜索网易云音乐
-            MusicPlayResult result = musicClient.searchAndGetFirst(keyword);
+            // 先拿酷我候选列表: 第一首能播的立刻播, 其余进连播队列
+            MusicPlayResult result = null;
+            List<NetEaseMusicClient.MusicSearchResult> cands = musicClient.kuwoCandidates(keyword);
+            int i = 0;
+            for (; i < cands.size() && i < 12; i++) {
+                String url = musicClient.kuwoResolve(cands.get(i));
+                if (url != null) {
+                    result = NetEaseMusicClient.toPlay(cands.get(i), url);
+                    break;
+                }
+            }
+            synchronized (queue) {
+                queue.clear();
+                if (result != null) {
+                    for (int k = i + 1; k < cands.size() && queue.size() < MAX_QUEUE; k++) {
+                        queue.add(cands.get(k));
+                    }
+                }
+            }
+            if (result == null) {
+                // 酷我不行再退回 gequbao(单曲, 无队列)
+                result = musicClient.searchAndGetFirst(keyword);
+            }
+            LogMgr.d(TAG, "queue size after search: " + queue.size());
             
             if (result == null) {
                 LogMgr.e(TAG, "search failed");
@@ -267,6 +317,8 @@ public class PhicommMusicSearchHandler extends SimpleUserEventInboundHandler<NLU
             LogMgr.d(TAG, "playUrl: " + playUrl);
             
             // 使用原厂 UniMediaPlayer 播放音频 URL
+            ensureListener();
+            playGen++;
             UniMediaPlayer.getInstance().playUrl(playUrl, "music_search");
             isPlaying = true;
             LogMgr.d(TAG, "music playing started");
@@ -307,12 +359,102 @@ public class PhicommMusicSearchHandler extends SimpleUserEventInboundHandler<NLU
         }
     }
     
+    private boolean isNextIntent(String text) {
+        for (String w : NEXT_WORDS) if (text.contains(w)) return true;
+        return false;
+    }
+
+    private boolean hasQueue() {
+        synchronized (queue) {
+            if (queue.isEmpty()) return false;
+            if (!isPlaying && System.currentTimeMillis() > queueKeptUntil) {
+                queue.clear();
+                return false;
+            }
+            return true;
+        }
+    }
+
+    /** 播放器回调: 一首自然播完(4)或出错, 自动接下一首。 */
+    private void ensureListener() {
+        if (listenerAdded) return;
+        listenerAdded = true;
+        UniMediaPlayer.getInstance().addIMediaPlayerStateListener(
+                new com.unisound.vui.common.media.IMediaPlayerStateListener() {
+                    @Override
+                    public void onPlayerState(int state, String tag) {
+                        if (!"music_search".equals(tag) || !isPlaying) return;
+                        // 出错时 onError 返回 false, MediaPlayer 随后也会回调 onCompletion(4), 所以只认 4
+                        if (state != 4) return;
+                        final int gen = playGen;
+                        LogMgr.d(TAG, "track ended (state=" + state + "), auto next");
+                        new Thread(new Runnable() {
+                            @Override
+                            public void run() {
+                                playNextSilent(gen);
+                            }
+                        }).start();
+                    }
+                });
+    }
+
+    /** 从队列取下一首能播的(后台线程调用, 有网络请求)。 */
+    private MusicPlayResult nextFromQueue() {
+        while (true) {
+            NetEaseMusicClient.MusicSearchResult c;
+            synchronized (queue) {
+                c = queue.poll();
+            }
+            if (c == null) return null;
+            String url = musicClient.kuwoResolve(c);
+            if (url != null) return NetEaseMusicClient.toPlay(c, url);
+        }
+    }
+
+    /** 自动连播: 不报歌名, 直接播。 */
+    private void playNextSilent(final int gen) {
+        final MusicPlayResult next = nextFromQueue();
+        mainHandler.post(new Runnable() {
+            @Override
+            public void run() {
+                if (gen != playGen || !isPlaying) return;   // 期间被打断/换歌了
+                if (next == null) {
+                    LogMgr.d(TAG, "queue finished");
+                    isPlaying = false;
+                    currentResult = null;
+                    return;
+                }
+                currentResult = next;
+                LogMgr.d(TAG, "auto next: " + next.name + " - " + next.artist);
+                playGen++;
+                UniMediaPlayer.getInstance().playUrl(next.playUrl, "music_search");
+            }
+        });
+    }
+
+    /** 说「下一首」: 报歌名后播(沿用 TTS 结束再播的流程)。 */
+    private void playNextAnnounced(ANTHandlerContext ctx) {
+        MusicPlayResult next = nextFromQueue();
+        if (next == null) {
+            ctx.playTTS("后面没有歌了，你可以说播放加歌名");
+            return;
+        }
+        currentResult = next;
+        ctx.stopWakeup();
+        ctx.stopASR();
+        String t = "下一首，" + next.name;
+        ctx.playTTS(t);
+    }
+
     /**
      * 停止音乐播放
      */
     private void stopMusic() {
         LogMgr.d(TAG, "stopMusic");
+        playGen++;                       // 让在途的"自动下一首"作废
+        queueKeptUntil = System.currentTimeMillis() + 5 * 60 * 1000L;  // 队列留 5 分钟给「下一首」
         if (isPlaying) {
+            isPlaying = false;
             try {
                 UniMediaPlayer.getInstance().stop();
             } catch (Throwable ignored) {}
