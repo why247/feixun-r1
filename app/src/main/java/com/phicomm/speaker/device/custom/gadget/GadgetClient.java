@@ -396,6 +396,20 @@ public final class GadgetClient {
                     if (payload == null) payload = new JSONObject();
                     log("event " + name);
                     if ("user".equals(payload.optString("role", ""))) continue;
+                    if ("agent.status".equals(name) || "task.status".equals(name)) {
+                        // 状态事件: 记下内容便于调参; message_done 之后若显示「空闲/完成」就立刻收尾(省掉 0.6 秒)
+                        String st = payload.toString();
+                        log(name + " " + (st.length() > 160 ? st.substring(0, 160) : st));
+                        if (inTurn && quietUntil > 0) {
+                            String low = st.toLowerCase();
+                            if (low.contains("idle") || low.contains("complete") || low.contains("finished")
+                                    || low.contains("\"done\"") || low.contains("ready")) {
+                                if (!messages.isEmpty()) quietUntil = System.currentTimeMillis();
+                            }
+                            // TODO: 拿到真实 payload 日志后, 再决定「忙」时是否延长等待(防多消息被截断)
+                        }
+                        continue;
+                    }
                     if ("delta.text_append".equals(name)) {
                         String t = payload.optString("text", "");
                         if (!t.isEmpty()) {
