@@ -326,24 +326,33 @@ public class NetEaseMusicClient {
     private static final Pattern KW_DURATION = Pattern.compile("'DURATION':'(\\d+)'");
 
     /** 泛指类关键词(儿歌/故事...)随机挑一首, 免得每次都是同一首 */
-    private static final String[] GENERIC_WORDS = {"儿歌", "童谣", "故事", "胎教", "摇篮曲", "歌", "音乐", "纯音乐"};
+    private static final String[] GENERIC_WORDS = {"儿歌", "童谣", "儿童歌曲", "宝宝歌", "故事", "胎教", "摇篮曲", "催眠曲", "歌", "音乐", "纯音乐"};
 
     private final java.util.Random random = new java.util.Random();
 
-    private MusicPlayResult kuwoSearchAndGet(String keyword) {
+    /** 正规儿歌厂牌, 泛指「儿歌」时优先 */
+    private static final String[] KID_BRANDS = {"贝乐虎", "儿歌多多", "宝宝巴士", "小伴龙", "贝瓦", "环尼宝贝", "巧虎", "碰碰狐", "小猪佩奇"};
+    /** 小朋友听着不合适的版本 */
+    private static final String[] BAD_WORDS = {"DJ", "dj", "串烧", "Remix", "remix", "伴奏", "铃声", "抖音", "加速", "降速"};
+
+    /**
+     * 酷我搜索, 返回候选列表(未解链, 直链有时效, 播到哪首再解哪首)。
+     * 泛指词(儿歌/童谣...): 过滤 DJ/串烧等, 厂牌优先, 再打乱顺序 —— 用于连播。
+     */
+    public List<MusicSearchResult> kuwoCandidates(String keyword) {
+        List<MusicSearchResult> cands = new ArrayList<MusicSearchResult>();
         try {
             String body = httpGet(KUWO_SEARCH + urlEncode(keyword), 2);
             if (body == null || body.isEmpty()) {
                 LogMgr.e(TAG, "kuwo search: empty");
-                return null;
+                return cands;
             }
             int list = body.indexOf("'abslist'");
             if (list < 0) {
                 LogMgr.e(TAG, "kuwo search: no abslist");
-                return null;
+                return cands;
             }
             String[] items = body.substring(list).split("\\{'AARTIST'");
-            List<MusicSearchResult> cands = new ArrayList<MusicSearchResult>();
             for (String it : items) {
                 Matcher rid = KW_RID.matcher(it);
                 if (!rid.find()) continue;
@@ -359,39 +368,73 @@ public class NetEaseMusicClient {
                 }
                 cands.add(r);
             }
-            LogMgr.d(TAG, "kuwo search '" + keyword + "': " + cands.size() + " results");
-            if (cands.isEmpty()) return null;
-
-            int start = 0;
-            for (String g : GENERIC_WORDS) {
-                if (g.equals(keyword)) { start = random.nextInt(cands.size()); break; }
+        } catch (Exception e) {
+            LogMgr.e(TAG, "kuwo search error: " + e);
+        }
+        if (isGeneric(keyword) && !cands.isEmpty()) {
+            List<MusicSearchResult> brand = new ArrayList<MusicSearchResult>();
+            List<MusicSearchResult> other = new ArrayList<MusicSearchResult>();
+            for (MusicSearchResult r : cands) {
+                String all = r.name + " " + r.artist;
+                if (containsAny(all, BAD_WORDS) || r.name.contains("|")) continue;
+                if (containsAny(all, KID_BRANDS)) brand.add(r); else other.add(r);
             }
-            // 没版权/会员曲, 酷我不报错而是给一段 11 秒的固定提示音(588957081.mp3), 要跳过
-            int tries = Math.min(12, cands.size());
-            for (int i = 0; i < tries; i++) {
-                MusicSearchResult c = cands.get((start + i) % cands.size());
-                String url = httpGet(KUWO_URL + c.id, 2);
-                if (url == null) continue;
-                url = url.trim();
-                if (!url.startsWith("http")) {
-                    LogMgr.d(TAG, "kuwo url bad for " + c.name + ": " + url);
-                    continue;
-                }
-                if (url.contains("/588957081.mp3")) {
-                    LogMgr.d(TAG, "kuwo placeholder (no rights), skip: " + c.name);
-                    continue;
-                }
-                if (url.startsWith("https://")) url = "http://" + url.substring(8);
-                MusicPlayResult res = new MusicPlayResult();
-                res.name = c.name;
-                res.artist = c.artist;
-                res.playUrl = url;
-                res.duration = c.duration;
+            java.util.Collections.shuffle(brand, random);
+            java.util.Collections.shuffle(other, random);
+            brand.addAll(other);
+            if (!brand.isEmpty()) cands = brand;
+        }
+        LogMgr.d(TAG, "kuwo search '" + keyword + "': " + cands.size() + " candidates");
+        return cands;
+    }
+
+    /** 给一首候选解出可播直链; 无版权(11 秒提示音)或失败返回 null。 */
+    public String kuwoResolve(MusicSearchResult c) {
+        String url = httpGet(KUWO_URL + c.id, 2);
+        if (url == null) return null;
+        url = url.trim();
+        if (!url.startsWith("http")) {
+            LogMgr.d(TAG, "kuwo url bad for " + c.name + ": " + url);
+            return null;
+        }
+        // 没版权/会员曲, 酷我不报错而是给一段 11 秒的固定提示音(588957081.mp3), 要跳过
+        if (url.contains("/588957081.mp3")) {
+            LogMgr.d(TAG, "kuwo placeholder (no rights), skip: " + c.name);
+            return null;
+        }
+        if (url.startsWith("https://")) url = "http://" + url.substring(8);
+        return url;
+    }
+
+    public static MusicPlayResult toPlay(MusicSearchResult c, String url) {
+        MusicPlayResult res = new MusicPlayResult();
+        res.name = c.name;
+        res.artist = c.artist;
+        res.playUrl = url;
+        res.duration = c.duration;
+        return res;
+    }
+
+    private static boolean isGeneric(String keyword) {
+        for (String g : GENERIC_WORDS) if (g.equals(keyword)) return true;
+        return false;
+    }
+
+    private static boolean containsAny(String s, String[] words) {
+        for (String w : words) if (s.contains(w)) return true;
+        return false;
+    }
+
+    private MusicPlayResult kuwoSearchAndGet(String keyword) {
+        List<MusicSearchResult> cands = kuwoCandidates(keyword);
+        int tries = Math.min(12, cands.size());
+        for (int i = 0; i < tries; i++) {
+            String url = kuwoResolve(cands.get(i));
+            if (url != null) {
+                MusicPlayResult res = toPlay(cands.get(i), url);
                 LogMgr.d(TAG, "kuwo ok: " + res.name + " - " + res.artist + " url=" + url);
                 return res;
             }
-        } catch (Exception e) {
-            LogMgr.e(TAG, "kuwo error: " + e);
         }
         return null;
     }
