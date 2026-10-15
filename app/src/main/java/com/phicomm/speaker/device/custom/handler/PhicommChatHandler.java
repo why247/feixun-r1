@@ -142,6 +142,7 @@ public class PhicommChatHandler extends SimpleUserEventInboundHandler<NLU> {
             this.useGadget = true;
             this.gadgetClient = new GadgetClient(creds);
             LogMgr.d(TAG, "Gadget: device credentials loaded, node=" + creds.nodeId());
+            this.gadgetClient.startKeepAlive();   // 开机就连好 + 保活, 问话时不用再建连
         } else {
             this.useGadget = gadgetToken != null && !gadgetToken.isEmpty();
             if (this.useGadget) {
@@ -154,6 +155,23 @@ public class PhicommChatHandler extends SimpleUserEventInboundHandler<NLU> {
         return super.onASREventEngineInitDone(ctx);
     }
     
+    /** 等待大模型时的短提示音(不走 TTS, 不影响引擎状态)。 */
+    private void playThinkingTone() {
+        try {
+            final android.media.ToneGenerator tg =
+                    new android.media.ToneGenerator(android.media.AudioManager.STREAM_MUSIC, 40);
+            tg.startTone(android.media.ToneGenerator.TONE_PROP_ACK, 150);
+            new Handler(Looper.getMainLooper()).postDelayed(new Runnable() {
+                @Override
+                public void run() {
+                    try { tg.release(); } catch (Throwable ignored) { }
+                }
+            }, 600);
+        } catch (Throwable t) {
+            LogMgr.e(TAG, "thinking tone failed: " + t);
+        }
+    }
+
     @Override
     public boolean acceptInboundEvent0(NLU evt) {
         // 只拦截 chat 意图
@@ -423,6 +441,7 @@ public class PhicommChatHandler extends SimpleUserEventInboundHandler<NLU> {
                             // 调用带 persona systemPrompt + 该 persona 历史
                             if (useGadget && gadgetClient != null) {
                                 // Gadget 直连 Brio: 只回文字, 走原厂 TTS 播放
+                                playThinkingTone();   // 先"嘀"一声, 让小朋友知道听到了
                                 try {
                                     response = gadgetClient.chat(
                                             activeSysPrompt, historyText, userInput);
@@ -510,7 +529,7 @@ public class PhicommChatHandler extends SimpleUserEventInboundHandler<NLU> {
                         LogMgr.e(TAG, "=== API 返回 null, openAIClient=" + openAIClient + " ===");
                         // v90: 没有语音要播了, 放行调侃(否则状态挂死 30s)
                         PlaybackStateMonitor.setTTSPlaying(false);
-                        ctx.playTTS("模型调用失败");
+                        ctx.playTTS("我暂时连不上网络大脑，等一下再问我吧");
                         if (isIdiomGameMode) {
                             isIdiomGameMode = false;
                         }
@@ -519,7 +538,7 @@ public class PhicommChatHandler extends SimpleUserEventInboundHandler<NLU> {
                     LogMgr.e(TAG, "chat failed: " + e);
                     e.printStackTrace();
                     PlaybackStateMonitor.setTTSPlaying(false);
-                    ctx.playTTS("模型调用失败");
+                    ctx.playTTS("我暂时连不上网络大脑，等一下再问我吧");
                     if (isIdiomGameMode) {
                         isIdiomGameMode = false;
                     }
