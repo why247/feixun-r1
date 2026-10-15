@@ -154,6 +154,9 @@ public class AIConfig {
     private String tts;
     private String user;
 
+    /** Muse Gadget 直连 token(mgst_...); 为空=不启用直连, 走 OpenAI 池 */
+    private String gadgetToken;
+
     /**
      * ── 三级兜底链 ──────────────────────────────────────────────────
      * 音箱调大模型时按顺序一级一级往下退，任何一级成功就停：
@@ -451,6 +454,9 @@ public class AIConfig {
                             case "api_key":
                                 if (!value.isEmpty()) this.apiKey = value;
                                 break;
+                            case "gadget_token":
+                                if (!value.isEmpty()) this.gadgetToken = value;
+                                break;
                             case "model":
                                 if (!value.isEmpty()) this.model = value;
                                 break;
@@ -554,6 +560,14 @@ public class AIConfig {
     
     public String getApiKey() {
         return apiKey;
+    }
+
+    /**
+     * Muse Gadget 直连 token(mgst_...)。为空表示不启用直连。
+     * 与 api_key 独立: 直连失败时回落走 OpenAI 池(v91 三级降级)。
+     */
+    public String getGadgetToken() {
+        return gadgetToken == null ? "" : gadgetToken.trim();
     }
     
     public String getModel() {

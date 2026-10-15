@@ -77,7 +77,7 @@ public class PhicommChatHandler extends SimpleUserEventInboundHandler<NLU> {
     // AI 客户端
     private OpenAIClient openAIClient;
 
-    // Gadget 直连: api_key 以 mgst_ 开头时启用, 直连 Brio(不用 OpenAI 池)
+    // Gadget 直连: gadget_token 非空即启用, 直连 Brio(失败回落 OpenAI 池)
     private GadgetClient gadgetClient;
     private boolean useGadget = false;
     
@@ -133,11 +133,11 @@ public class PhicommChatHandler extends SimpleUserEventInboundHandler<NLU> {
         AIConfig config = AIConfig.load(context);
         this.openAIClient = new OpenAIClient(config);
 
-        // Gadget 直连: api_key 填 SDK token(mgst_...) 即直连 Brio, 不走 OpenAI 池
-        String gadgetKey = config.getApiKey();
-        this.useGadget = gadgetKey != null && gadgetKey.trim().startsWith("mgst_");
+        // Gadget 直连: gadget_token 非空即启用, 直连 Brio; 失败时回落 OpenAI 池
+        String gadgetToken = config.getGadgetToken();
+        this.useGadget = gadgetToken != null && !gadgetToken.isEmpty();
         if (this.useGadget) {
-            this.gadgetClient = new GadgetClient(gadgetKey.trim());
+            this.gadgetClient = new GadgetClient(gadgetToken);
         }
         
         LogMgr.d(TAG, "PhicommChatHandler initialized with model: " + config.getModel());
@@ -414,13 +414,22 @@ public class PhicommChatHandler extends SimpleUserEventInboundHandler<NLU> {
                             if (useGadget && gadgetClient != null) {
                                 // Gadget 直连 Brio: 只回文字, 走原厂 TTS 播放
                                 try {
-                                    response = gadgetClient.chat(activeSysPrompt, userInput);
+                                    response = gadgetClient.chat(
+                                            activeSysPrompt, historyText, userInput);
                                 } catch (Exception ge) {
-                                    LogMgr.e(TAG, "Gadget 直连失败: " + ge);
-                                    response = null;
+                                    LogMgr.e(TAG, "Gadget 直连失败, 回落 OpenAI: " + ge);
                                 }
-                                llmAudio = null;
-                                llmAudioFormat = null;
+                                if (response == null || response.isEmpty()) {
+                                    // 直连失败/超时: 回落走 OpenAI 池(v91 三级降级)
+                                    OpenAIClient.Reply r = openAIClient.chatWithHistoryEx(
+                                            userInput, historyText, activeSysPrompt, null);
+                                    response = (r == null) ? null : r.text;
+                                    llmAudio = (r == null) ? null : r.audio;
+                                    llmAudioFormat = (r == null) ? null : r.audioFormat;
+                                } else {
+                                    llmAudio = null;
+                                    llmAudioFormat = null;
+                                }
                             } else {
                                 OpenAIClient.Reply r = openAIClient.chatWithHistoryEx(
                                         userInput, historyText, activeSysPrompt, null);

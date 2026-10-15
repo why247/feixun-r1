@@ -58,7 +58,7 @@ public final class GadgetClient {
         SSLSocketFactory f = (SSLSocketFactory) SSLSocketFactory.getDefault();
         try (SSLSocket s = (SSLSocket) f.createSocket(FETCH_HOST, 443)) {
             s.setSoTimeout(15_000);
-            String req = "GET /fetch_vms HTTP/1.1\r\n"
+            String req = "GET /fetch_vms HTTP/1.0\r\n"
                     + "Host: " + FETCH_HOST + "\r\n"
                     + "Authorization: Bearer " + sdkToken + "\r\n"
                     + "X-API-Version: 1.0.0\r\n"
@@ -157,19 +157,33 @@ public final class GadgetClient {
     // ---------------- chat ----------------
     /**
      * One text turn. systemPrompt: persona prompt (may be null).
-     * Returns the assistant's reply text.
+     * historyText: recent persona history, may be null (truncated to ~1500 chars).
+     * Returns the assistant's reply text (may be empty on failure/timeout).
      */
-    public synchronized String chat(String systemPrompt, String userInput) throws Exception {
-        String text = (systemPrompt != null && !systemPrompt.isEmpty())
-                ? systemPrompt + "\n\n" + userInput : userInput;
+    public synchronized String chat(String systemPrompt, String historyText,
+                                    String userInput) throws Exception {
+        if (sock == null || noise == null) {
+            connect();   // first turn (PhicommChatHandler only news the client)
+        }
+        StringBuilder sb = new StringBuilder();
+        if (systemPrompt != null && !systemPrompt.isEmpty())
+            sb.append(systemPrompt).append("\n\n");
+        if (historyText != null && !historyText.isEmpty()) {
+            String h = historyText.length() > 1500
+                    ? historyText.substring(historyText.length() - 1500) : historyText;
+            sb.append(h).append("\n\n");
+        }
+        sb.append(userInput);
         byte[] body = new JSONObject()
-                .put("message", text)
+                .put("message", sb.toString())
                 .put("output_modality", "text")
                 .toString().getBytes(StandardCharsets.UTF_8);
+        subBuf.reset();  // drop any late events from the previous turn
         try {
             return doChat(body);
-        } catch (IOException e) {
-            connect();           // one reconnect attempt
+        } catch (Exception e) {
+            connect();           // one reconnect attempt (covers IO + protocol errors)
+            subBuf.reset();
             return doChat(body);
         }
     }
@@ -185,9 +199,10 @@ public final class GadgetClient {
 
         while (true) {
             long now = System.currentTimeMillis();
+            // Hard deadline: always exit, never hang (method is synchronized).
+            // Return whatever text arrived (may be partial or empty).
+            if (now >= deadline) break;
             if (inTurn && quietUntil > 0 && now >= quietUntil) break;
-            if (now >= deadline && !inTurn)
-                throw new IOException("reply timeout: no assistant message");
             sock.setSoTimeout((int) Math.max(500, Math.min(5_000, deadline - now)));
             byte[] frame;
             try {
@@ -248,6 +263,9 @@ public final class GadgetClient {
             subBuf.reset();
             if (start < buf.length) subBuf.write(buf, start, buf.length - start);
         }
+        // Flush any partial message (e.g. deadline hit mid-turn).
+        if (cur.length() > 0 && cur.toString().trim().length() > 0)
+            messages.add(cur.toString());
         StringBuilder out = new StringBuilder();
         for (String m : messages) {
             if (out.length() > 0) out.append('\n');
