@@ -187,13 +187,55 @@ public final class GadgetProto {
         public int status;           // response only
         public byte[] body;          // response.body or chunk.data
         public boolean endBody;
+        public boolean isReset;
     }
 
-    /** Decode one decrypted transport payload. */
+    /**
+     * Reassembles NoiseTransportFrame chunks {1 chunk_id, 2 chunk_index, 3 total_chunks, 4 payload}.
+     * feed() returns the full ServiceResponse bytes, or null while chunks are pending.
+     */
+    public static final class Reassembler {
+        private final Map<Long, byte[][]> pending = new java.util.HashMap<>();
+
+        public byte[] feed(byte[] transportPlaintext) {
+            Map<Integer, List<Field>> f = parse(transportPlaintext);
+            long id = firstVarint(f, 1);
+            int idx = (int) firstVarint(f, 2);
+            int total = f.containsKey(3) ? (int) firstVarint(f, 3) : 1;
+            byte[] payload = firstBytes(f, 4);
+            if (total <= 1) return payload;
+            if (total > 1024 || idx < 0 || idx >= total)
+                throw new IllegalArgumentException("bad chunk " + idx + "/" + total);
+            byte[][] parts = pending.get(id);
+            if (parts == null || parts.length != total) {
+                if (pending.size() > 32) pending.clear();
+                parts = new byte[total][];
+                pending.put(id, parts);
+            }
+            parts[idx] = payload;
+            for (byte[] p : parts) if (p == null) return null;
+            pending.remove(id);
+            ByteArrayOutputStream out = new ByteArrayOutputStream();
+            for (byte[] p : parts) out.write(p, 0, p.length);
+            return out.toByteArray();
+        }
+    }
+
+    /** Decode one decrypted, single-chunk transport payload (legacy entry point). */
     public static ServerFrame decodeServerFrame(byte[] transportPlaintext) {
-        byte[] payload = firstBytes(parse(transportPlaintext), 4);
-        if (payload.length == 0) throw new IllegalArgumentException("empty transport payload");
-        byte[] frameBytes = firstBytes(parse(payload), 2);
+        return decodeServiceResponse(firstBytes(parse(transportPlaintext), 4));
+    }
+
+    /**
+     * Decode a reassembled ServiceResponse { 1: payload = ServiceFrame }.
+     * ServiceFrame { 1 stream_id, 3 response{1 status, 3 body, 4 end_body}, 4 body_chunk{1 data, 2 end}, 5 reset }.
+     */
+    public static ServerFrame decodeServiceResponse(byte[] serviceResponse) {
+        if (serviceResponse == null || serviceResponse.length == 0)
+            throw new IllegalArgumentException("empty transport payload");
+        Map<Integer, List<Field>> sr = parse(serviceResponse);
+        byte[] frameBytes = firstBytes(sr, 1);              // per muse-gadget-sdk envelope.py
+        if (frameBytes.length == 0) frameBytes = firstBytes(sr, 2);
         if (frameBytes.length == 0) throw new IllegalArgumentException("empty service frame");
         Map<Integer, List<Field>> fr = parse(frameBytes);
         ServerFrame sf = new ServerFrame();
@@ -209,6 +251,10 @@ public final class GadgetProto {
             sf.isResponse = false;
             sf.body = firstBytes(c, 1);
             sf.endBody = firstVarint(c, 2) != 0;
+        } else if (fr.containsKey(5)) {
+            sf.isReset = true;
+            sf.body = new byte[0];
+            sf.endBody = true;
         } else {
             throw new IllegalArgumentException("unknown service frame kind");
         }
