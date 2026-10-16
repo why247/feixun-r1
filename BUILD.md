@@ -84,7 +84,11 @@ adb logcat -d -v time -s Gadget PhicommChat OpenAIClient MusicClient PhicommMusi
   - `PhicommChat: stream: all N sentence(s) spoken in …ms -> multi-turn/wakeup` → 最后一句结束, 才进多轮 ASR / 唤醒
   - `PhicommChat: stream turn T cancelled (new question|interrupt …|exit), drop K queued sentence(s)` / `stream: drop stale sentence of turn …` → 打断/新一轮丢弃旧句
   - `PhicommChat: stream: TTS end of #k not received, advance anyway` → 某句结束事件丢失, 看门狗推进(8s+0.35s/字)
-  - 日志只打序号/长度/耗时, 不打 token 和凭证; 句子原文只写 /sdcard/eav_event.log(`=== 流式 TTS #k ===`)
+  - 日志只打序号/长度/耗时, 不打 token 和凭证; 句子原文写 /sdcard/eav_event.log 的开关 v73 起默认关(PhicommChatHandler.DEBUG_LOG_FILE=false, 调试时改 true)
+- v73 新日志关键词:
+  - `Gadget: pre-chat drain: clean probe …ms` → 上一轮干净结束, 发问前只探测 30ms; `… dropped N leftover frames in …ms (after clean turn)` → 干净结束后仍有残余帧(已退回 150ms 读完); `stream end (message_done): … clean` → 本轮被判为干净结束
+  - `PhicommChat: chat: drop stale reply gen G (now H) at …` → 打断/退出/新一轮后, 旧轮次大模型结果被丢弃(不再主线程忙等 2s)
+  - `PhicommMusicSearch: music pool busy (N), run on temp thread` → 音乐后台线程池 4 个都忙, 临时线程兜底(偶发正常, 频繁说明有任务卡住)
 
 ## QQ 音乐会员（可选）
 
