@@ -61,7 +61,7 @@ adb reboot
 ## 看日志
 
 ```bat
-adb logcat -d -v time -s Gadget PhicommChat OpenAIClient MusicClient PhicommMusicSearch PostTeaser PersonaManager TencentASR NLUDispatcher > r1.log
+adb logcat -d -v time -s Gadget PhicommChat OpenAIClient MusicClient PhicommMusicSearch PostTeaser PersonaManager > r1.log
 ```
 
 - `MusicClient: lossless ok src=kuwo-mobi q=flac` / `src=gd-netease q=flac(1411k)` → 正在放无损
@@ -93,36 +93,6 @@ adb logcat -d -v time -s Gadget PhicommChat OpenAIClient MusicClient PhicommMusi
   - `Gadget: stream: first sentence ready after …ms (len=N)` → v74 起第一句只要有句末标点且有效字≥1 就切(「好的！」不再被扣留), len 可能很小; 第二句起仍需≥4 个有效字
   - `Gadget: event delta.text_append (first of turn; rest not logged)` → 每轮只记首个文字碎片事件; `Gadget: stream end (…): text_append=N sentences=M …` → 本轮碎片总数
   - `NativeANTEngine: doStopWakeup isWakeUp:true|false`(紧挨 `stream: speak first sentence`) → 等 Muse 期间唤醒是否在跑(true=期间可喊「小爱同学」打断, 首句开播时才停)
-- v75 新日志关键词(腾讯云语音识别, tag `TencentASR`; 没推 tencent_asr.json 时一行都不会有):
-  - `TencentASR: config loaded: engine=… timeout=…ms` → 读到配置(只打长度, 不打密钥); `pcm tap installed` → 已接上云知声音频
-  - `TencentASR: session N start engine=…` / `connected in …ms` → 唤醒后开一路腾讯识别(唤醒监听期间不开)
-  - `TencentASR: session N first partial in …ms since recording start` → 腾讯首个中间结果
-  - `TencentASR: session N audio end (speech end|recording stop) audio=…ms` → 云知声 VAD 说完, 腾讯发 end
-  - `TencentASR: session N final in …ms after end, … text=…` → 腾讯最终文字
-  - `TencentASR: hold unisound result (service=… text=…)` → 云知声结果已扣住, 等腾讯
-  - `TencentASR: route tencent text=… -> cn.yunzhisheng.chat|music|weather (unisound service=… text=…, waited …ms)` → 用腾讯文字分发
-  - `TencentASR: same text as unisound -> keep unisound nlu` / `keep unisound native service=…` → 用云知声原结果
-  - `TencentASR: fallback reason=… -> unisound` → 腾讯超时/出错/空结果, 回退云知声(reason 里有 timeout / code=… / network)
-  - `TencentASR: disabled for 30 min (code=4002|4003|4004|4005 …)` → 密钥错/未开通/引擎无额度/欠费, 30 分钟内直接走云知声; 重新推配置立即重试
-  - `TencentASR: clock skew …s vs server` → 音箱时钟不准, 已按服务器时间重签
-
-## 腾讯云语音识别（可选, v75）
-
-唤醒词「小爱同学」、唤醒回应、TTS 仍是云知声; 唤醒后的识别改用腾讯云实时语音识别(潮州话/普通话混合)。
-云知声识别同时照跑, 腾讯超时(默认说完后 4s)/出错时自动用云知声结果。没有配置文件 = 完全原流程。
-
-1. 腾讯云注册 → 实名认证 → 控制台搜「语音识别」开通 → 访问管理 → API 密钥管理 → 新建密钥(记下 AppID、SecretId、SecretKey)。
-2. 默认引擎 `16k_zh_en_2.0`(大模型2.0, 支持潮汕话) **不在每月 5 小时免费额度里**: 买「实时语音识别(大模型2.0版)」资源包(60 小时 60 元/年)或在语音识别控制台开启后付费(1 元/小时, 日结)。只想用免费额度就加 `--engine 16k_zh`(普通话)。
-3. 推密钥(在电脑终端输入, 不回显; 不要发到聊天里):
-
-```bat
-python tools\tencent_asr_push.py --adb 192.168.10.204:5555 --restart
-python tools\tencent_asr_push.py --adb 192.168.10.204:5555 --engine 16k_zh --restart   # 只用免费额度(普通话)
-python tools\tencent_asr_push.py --adb 192.168.10.204:5555 --remove --restart          # 关掉, 回纯云知声
-```
-
-脚本会先用 1 秒静音自检(code=0 可用; 4004 = 这个引擎没有额度, 去买资源包/开后付费)。
-日志: `adb logcat -v time -s TencentASR NLUDispatcher PhicommChat`。
 
 ## QQ 音乐会员（可选）
 
