@@ -107,7 +107,11 @@ public final class GadgetClient {
     private volatile boolean reconnectNow = false;
     /** 保活线程正在锁外建连: 对话线程先等它(wait 释放锁), 不重复建第二条 */
     private volatile boolean warmConnecting = false;
-    private static final long WAIT_WARM_CONNECT_MS = 8_000;
+    /**
+     * v78: 8s -> 20s。建连由 connectLock 串行, 等不及自己再建只会排在后台那条后面再建一条(实测 9.5s 的
+     * warm connect 会变成 9.5s + 再一次握手); 等它更快。被打断(cancelGen 变化)仍立即放弃。
+     */
+    private static final long WAIT_WARM_CONNECT_MS = 20_000;
     /** 保活: 最近一次收到任意帧 / 发 ping 的时间, 服务器是否回过 pong */
     private volatile long lastRxAt = 0;
     private volatile long lastPingAt = 0;
@@ -485,6 +489,12 @@ public final class GadgetClient {
                     + (sock != null ? "ready" : "not ready") + ")");
         }
         if (sock == null || noise == null) {
+            // v78: 保活线程还没开始的重连请求由本线程直接做掉, 免得之后 tick 看到 reconnectNow
+            // 把刚建好的连接又关掉重建(之后若再有断网/换网, onNetworkChange 会重新置位)
+            if (reconnectNow) {
+                reconnectNow = false;
+                log("chat: connect now (pending background reconnect taken over)");
+            }
             connect();   // first turn / keep-alive 还没连上
         }
         if (cancelGen != myGen) return "";
@@ -894,11 +904,13 @@ public final class GadgetClient {
                 }
                 need = true;
                 gen = connGen;
+                // v78: 在锁内置位。原来出锁后才置位, 中间对话线程抢到锁会看到「没连接也没人在连」,
+                // 于是自己 connect() —— 被 connectLock 排在这条后台连接后面, 串行建两条连接
+                warmConnecting = true;
             }
             if (need) {
                 long t0 = System.currentTimeMillis();
                 Conn c;
-                warmConnecting = true;
                 try {
                     c = openConn();   // 不持有对象锁: 对话线程此时可以照常用/自己建连
                 } catch (Exception e) {
