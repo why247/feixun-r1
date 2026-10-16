@@ -691,6 +691,7 @@ public class NetEaseMusicClient {
         HttpURLConnection conn = null;
         BufferedReader reader = null;
         OutputStream os = null;
+        boolean clean = false;   // v78: 同 httpGetOnce, 读到 EOF 后 close 不 disconnect(连接回池)
 
         try {
             URL url = new URL(urlStr);
@@ -724,6 +725,7 @@ public class NetEaseMusicClient {
             while ((line = reader.readLine()) != null) {
                 response.append(line);
             }
+            clean = true;
 
             return response.toString();
 
@@ -737,7 +739,7 @@ public class NetEaseMusicClient {
                 } catch (Exception ignored) {}
             }
             closeQuietly(reader);
-            if (conn != null) {
+            if (conn != null && !clean) {
                 try {
                     conn.disconnect();
                 } catch (Exception ignored) {}
