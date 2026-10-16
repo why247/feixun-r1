@@ -660,6 +660,7 @@ public final class GadgetClient {
         StringBuilder cur = new StringBuilder();   // 当前这条消息已收到的增量文字
         boolean sawDelta = false;                  // 本轮收到过 text_append(之后不再采用整条消息文字, 防重复)
         boolean inTurn = false;
+        int textAppends = 0;                       // 本轮 delta.text_append 个数(只首个打 event 日志, v74)
         long quietUntil = 0;
         String endReason = "deadline " + REPLY_TIMEOUT_MS + "ms";
 
@@ -753,7 +754,12 @@ public final class GadgetClient {
                     String name = ev.optString("event", "");
                     JSONObject payload = ev.optJSONObject("payload");
                     if (payload == null) payload = new JSONObject();
-                    log("event " + name);
+                    if ("delta.text_append".equals(name)) {
+                        // v74: 文字碎片事件很多, 每轮只记首个; 个数在 stream end 日志里
+                        if (textAppends++ == 0) log("event " + name + " (first of turn; rest not logged)");
+                    } else {
+                        log("event " + name);
+                    }
                     if ("user".equals(payload.optString("role", ""))) {
                         gotHttp = true;   // 服务端已收到本轮问题(回显), 连接是活的
                         continue;
@@ -822,7 +828,7 @@ public final class GadgetClient {
         String out = ss.all.toString().trim();
         // 干净结束: message_done 后 grace 期满(不是 deadline/文字静默/取消), 且没有残留的半条分片/半行
         lastTurnClean = "message_done".equals(endReason) && !reasm.hasPending() && subBuf.size() == 0;
-        log("stream end (" + endReason + "): sentences=" + ss.emitted + " chars=" + out.length()
+        log("stream end (" + endReason + "): text_append=" + textAppends + " sentences=" + ss.emitted + " chars=" + out.length()
                 + " in " + (System.currentTimeMillis() - startedAt) + " ms" + (lastTurnClean ? " clean" : ""));
         return out;
     }
