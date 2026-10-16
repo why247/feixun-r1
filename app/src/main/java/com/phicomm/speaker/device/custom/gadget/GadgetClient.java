@@ -44,7 +44,12 @@ public final class GadgetClient {
     private static final int VM_PORT = 443;
     private static final String WS_KEY = "dGhlIHNhbXBsZSBub25jZQ==";
 
-    private static final long REPLY_TIMEOUT_MS = 60_000;
+    /** 整轮硬超时(原 60s): 到点还没有任何句子就放弃, 由上层播「网络有点慢」 */
+    private static final long REPLY_TIMEOUT_MS = 40_000;
+    /** 首字超时: 发问后这么久还没有任何文字就放弃(Muse 正常 6~9 秒出首字) */
+    private static final long FIRST_TEXT_TIMEOUT_MS = 20_000;
+    /** chat/stream 的 HTTP 响应这么久没到 = 连接半死, 重连重问一次 */
+    private static final long HTTP_RESP_TIMEOUT_MS = 4_000;
     /** 已有文字且 text_append 静默这么久才算整段说完(不再用 250ms 截断, 长回答可能分多段) */
     private static final long TEXT_QUIET_MS = 3_000;
     /** 收到 message_done 后再等这么久, 看是否还有下一段消息; 剩余文字在 message_done 时立即切出 */
@@ -52,25 +57,57 @@ public final class GadgetClient {
     /** 发新问题前读掉上一轮提前返回后残留的事件, 读到连续这么久没新帧为止 */
     private static final long PRE_DRAIN_QUIET_MS = 150;
     private static final long KEEPALIVE_MS = 25_000;
+    /** 保活重连退避上限(原 300s) */
+    private static final long MAX_BACKOFF_MS = 60_000;
+    /** 读循环每片最长等待: 决定打断/取消被发现的速度 */
+    private static final int READ_SLICE_MS = 300;
+    /** 帧读到一半后, 剩余字节的读超时(只允许在帧首字节之前超时) */
+    private static final int MID_FRAME_TIMEOUT_MS = 10_000;
 
-    /** 首轮随人设一起发的儿童规则(每条连接只发一次, 之后靠 Muse 自己的会话记忆) */
+    /** 首轮随人设一起发的儿童规则(每条新连接第一轮发一次) */
     private static final String KID_RULES =
             "你是家里智能音箱里的小伙伴, 正在和一个小朋友说话。"
             + "回答用 3 句话以内, 口语化, 不用列表、符号、表情和英文缩写, 方便直接朗读。"
             + "只聊天和讲知识/故事, 不执行任何操作或工具, 不讲吓人、暴力、不适合儿童的内容。";
+    /** 每一轮都带的短规则(Muse 会话被服务端重置时规则也不会丢) */
+    static final String KID_RULE_SHORT =
+            "(提示: 对小朋友说话, 3句以内, 口语, 不讲吓人或不适合儿童的内容)";
     private boolean personaSent = false;
     private Thread keepAliveThread;
     private volatile boolean keepAliveRunning = false;
 
     private final String sdkToken;          // legacy, only when creds == null
     private final DeviceCredentials creds;  // from Muse BLE pairing (preferred)
-    private Socket sock;
+    private volatile Socket sock;
     private InputStream in;
     private OutputStream out;
     private NoiseXX noise;
     private int nextStream = 1;
     private int subStream;
     private final ByteArrayOutputStream subBuf = new ByteArrayOutputStream();
+    private final ByteArrayOutputStream ctrlBuf = new ByteArrayOutputStream();
+
+    /** 建连(fetch_vms + TLS + WS + Noise)串行化, 但不占用对象锁 */
+    private final Object connectLock = new Object();
+    /** 每装上一条新连接 +1 */
+    private int connGen = 0;
+    /** 打断/新提问: +1, 正在读的流看到变化立即跳出并释放锁 */
+    private volatile int cancelGen = 0;
+    /** 网络恢复 / 收到断线信号: 保活线程立即重连 */
+    private volatile boolean reconnectNow = false;
+    /** 保活: 最近一次收到任意帧 / 发 ping 的时间, 服务器是否回过 pong */
+    private volatile long lastRxAt = 0;
+    private volatile long lastPingAt = 0;
+    private volatile boolean pongSeen = false;
+    private int missedPongs = 0;
+    /** 网络状态(CONNECTIVITY_CHANGE) */
+    private volatile Boolean lastNetUp = null;
+    private volatile String lastNetKey = null;
+
+    /** 发问后首字/整轮超时(没有任何句子): 上层应播简短提示, 不再回落重问 */
+    public static final class ReplyTimeout extends IOException {
+        ReplyTimeout(String m) { super(m); }
+    }
 
     public GadgetClient(String sdkToken) {
         this.sdkToken = sdkToken;
@@ -81,6 +118,7 @@ public final class GadgetClient {
         this.sdkToken = null;
         this.creds = creds;
     }
+
 
     private String apiHost() {
         if (creds == null) return FETCH_HOST;
@@ -186,51 +224,98 @@ public final class GadgetClient {
     }
 
     // ---------------- connect ----------------
-    public synchronized void connect() throws Exception {
-        close();
-        VmInfo vm = fetchVms();
-        SSLSocketFactory f = (SSLSocketFactory) SSLSocketFactory.getDefault();
-        SSLSocket s = (SSLSocket) f.createSocket(vmHost(), VM_PORT);
-        s.setSoTimeout(15_000);
-        sock = s;
-        in = s.getInputStream();
-        out = s.getOutputStream();
+    /** 一条已完成 Noise 握手、还没装到客户端上的连接 */
+    private static final class Conn {
+        SSLSocket sock;
+        InputStream in;
+        OutputStream out;
+        NoiseXX noise;
+        void closeQuiet() {
+            try { sock.close(); } catch (IOException ignored) { }
+        }
+    }
 
-        String path = "/v1/noise?vm_id=" + URLEncoder.encode(vm.vmId, "UTF-8");
-        String req = "GET " + path + " HTTP/1.1\r\n"
-                + "Host: " + vmHost() + "\r\n"
-                + "Authorization: Bearer " + vm.vmToken + "\r\n"
-                + "Upgrade: websocket\r\n"
-                + "Connection: Upgrade\r\n"
-                + "Sec-WebSocket-Key: " + WS_KEY + "\r\n"
-                + "Sec-WebSocket-Version: 13\r\n\r\n";
-        out.write(req.getBytes(StandardCharsets.US_ASCII));
-        out.flush();
-        int status = parseStatus(readHeaders(in));
-        if (status == 401 || status == 403)
-            throw new IOException("VM refused the token (HTTP " + status + ")");
-        if (status != 101)
-            throw new IOException("WS upgrade failed (HTTP " + status + ")");
-        log("WS upgraded to " + vmHost());
+    /**
+     * 建一条新连接(fetch_vms -> TLS -> WS upgrade -> Noise XX)。只用局部变量,
+     * 不碰当前连接, 也不需要对象锁; connectLock 只保证同一时刻只有一个线程在建连/刷新令牌。
+     */
+    private Conn openConn() throws Exception {
+        synchronized (connectLock) {
+            VmInfo vm = fetchVms();
+            SSLSocketFactory f = (SSLSocketFactory) SSLSocketFactory.getDefault();
+            SSLSocket s = (SSLSocket) f.createSocket(vmHost(), VM_PORT);
+            try {
+                s.setSoTimeout(15_000);
+                Conn c = new Conn();
+                c.sock = s;
+                c.in = s.getInputStream();
+                c.out = s.getOutputStream();
+                String path = "/v1/noise?vm_id=" + URLEncoder.encode(vm.vmId, "UTF-8");
+                String req = "GET " + path + " HTTP/1.1\r\n"
+                        + "Host: " + vmHost() + "\r\n"
+                        + "Authorization: Bearer " + vm.vmToken + "\r\n"
+                        + "Upgrade: websocket\r\n"
+                        + "Connection: Upgrade\r\n"
+                        + "Sec-WebSocket-Key: " + WS_KEY + "\r\n"
+                        + "Sec-WebSocket-Version: 13\r\n\r\n";
+                c.out.write(req.getBytes(StandardCharsets.US_ASCII));
+                c.out.flush();
+                int status = parseStatus(readHeaders(c.in));
+                if (status == 401 || status == 403)
+                    throw new IOException("VM refused the token (HTTP " + status + ")");
+                if (status != 101)
+                    throw new IOException("WS upgrade failed (HTTP " + status + ")");
+                log("WS upgraded to " + vmHost());
+                NoiseXX nz = new NoiseXX();
+                wsSend(c.out, nz.writeMessage1());
+                nz.readMessage2(wsRecv(s, c.in, c.out));
+                wsSend(c.out, nz.writeMessage3(new byte[0]));
+                log("Noise XX handshake done");
+                c.noise = nz;
+                return c;
+            } catch (Exception e) {
+                try { s.close(); } catch (IOException ignored) { }
+                throw e;
+            }
+        }
+    }
 
-        noise = new NoiseXX();
-        wsSend(noise.writeMessage1());
-        noise.readMessage2(wsRecv());
-        wsSend(noise.writeMessage3(new byte[0]));
-        log("Noise XX handshake done");
+    /** 持有对象锁调用: 换上新连接, 发 link.register + 打开 subscribe(只有几次发送, 很快)。 */
+    private void install(Conn c) throws Exception {
+        closeQuiet();
+        sock = c.sock;
+        in = c.in;
+        out = c.out;
+        noise = c.noise;
         nextStream = 1;
         subBuf.reset();
+        ctrlBuf.reset();
         personaSent = false;
-        if (creds != null) registerDevice();
-        subStream = openStream("POST", "/chat/subscribe",
-                new String[]{"Content-Type", "application/json", "Accept", "application/x-ndjson",
-                        "x-app-id", "musegadget"},
-                "{}".getBytes(StandardCharsets.UTF_8), true);
+        connGen++;
+        lastRxAt = System.currentTimeMillis();
+        lastPingAt = 0;
+        missedPongs = 0;
+        try {
+            if (creds != null) registerDevice();
+            subStream = openStream("POST", "/chat/subscribe",
+                    new String[]{"Content-Type", "application/json", "Accept", "application/x-ndjson",
+                            "x-app-id", "musegadget"},
+                    "{}".getBytes(StandardCharsets.UTF_8), true);
+        } catch (Exception e) {
+            closeQuiet();
+            throw e;
+        }
+    }
+
+    /** 对话线程用(已持有锁或首次): 同步建连并装上。 */
+    public synchronized void connect() throws Exception {
+        close();
+        install(openConn());
     }
 
     /** Control stream + link.register, so chat turns are attributed to this paired device. */
     private void registerDevice() throws Exception {
-        int sid = controlStream = openStream("POST", "/link-control",
+        controlStream = openStream("POST", "/link-control",
                 new String[]{"x-app-id", "musegadget"}, new byte[0], false);
         JSONObject params = new JSONObject()
                 .put("node_id", creds.nodeId())
@@ -241,21 +326,85 @@ public final class GadgetClient {
                 .put("model_id", "linux")
                 .put("is_wakeup_supported", false)
                 .put("commands_v2", new JSONObject());
-        byte[] msg = new JSONObject()
+        sendControl(new JSONObject()
                 .put("type", "req")
                 .put("id", java.util.UUID.randomUUID().toString())
                 .put("method", "link.register")
-                .put("params", params)
-                .toString().getBytes(StandardCharsets.UTF_8);
+                .put("params", params));
+        log("sent link.register as " + creds.nodeId());
+    }
+
+    /** 控制流消息: 4 字节小端长度前缀 + JSON。 */
+    private void sendControl(JSONObject m) throws Exception {
+        byte[] msg = m.toString().getBytes(StandardCharsets.UTF_8);
         byte[] framed = new byte[4 + msg.length];
         framed[0] = (byte) msg.length;
         framed[1] = (byte) (msg.length >>> 8);
         framed[2] = (byte) (msg.length >>> 16);
         framed[3] = (byte) (msg.length >>> 24);   // little-endian u32 length prefix
         System.arraycopy(msg, 0, framed, 4, msg.length);
-        byte[] env = GadgetProto.encodeBodyChunkEnvelope(sid, framed, false);
+        byte[] env = GadgetProto.encodeBodyChunkEnvelope(controlStream, framed, false);
         wsSend(noise.encrypt(GadgetProto.encodeTransportFrame(env)));
-        log("sent link.register as " + creds.nodeId());
+    }
+
+    /**
+     * 服务器在控制流上发来的数据(持有锁调用)。按 4 字节小端长度前缀拆消息(整段以 '{' 开头时按单条 JSON);
+     * type=req(如 link.invoke)一律回 {type:res, ok:false, error:{code:unsupported}}, 本设备不执行任何命令。
+     * 日志只打 type/method, 不打内容。
+     */
+    private void handleControl(GadgetProto.ServerFrame sf) {
+        if (sf.isResponse) log("control: resp " + sf.status);
+        if (sf.body == null || sf.body.length == 0) return;
+        try {
+            if (ctrlBuf.size() == 0 && sf.body[0] == '{') {
+                onControlMessage(new String(sf.body, StandardCharsets.UTF_8));
+                return;
+            }
+            ctrlBuf.write(sf.body, 0, sf.body.length);
+            byte[] b = ctrlBuf.toByteArray();
+            int p = 0;
+            while (b.length - p >= 4) {
+                long len = (b[p] & 0xFFL) | ((b[p + 1] & 0xFFL) << 8) | ((b[p + 2] & 0xFFL) << 16)
+                        | ((b[p + 3] & 0xFFL) << 24);
+                if (len > (1 << 20)) {
+                    log("control: bad frame length " + len + ", drop buffer");
+                    ctrlBuf.reset();
+                    return;
+                }
+                if (b.length - p - 4 < len) break;
+                onControlMessage(new String(b, p + 4, (int) len, StandardCharsets.UTF_8));
+                p += 4 + (int) len;
+            }
+            ctrlBuf.reset();
+            if (p < b.length) ctrlBuf.write(b, p, b.length - p);
+        } catch (Exception e) {
+            log("control: handle error " + e.getClass().getSimpleName());
+            ctrlBuf.reset();
+        }
+    }
+
+    private void onControlMessage(String js) throws Exception {
+        JSONObject m;
+        try {
+            m = new JSONObject(js);
+        } catch (JSONException e) {
+            log("control: non-JSON message (" + js.length() + " chars)");
+            return;
+        }
+        String type = m.optString("type", "");
+        String method = m.optString("method", "");
+        log("control: " + type + (method.isEmpty() ? "" : " " + method)
+                + (m.has("ok") ? " ok=" + m.optBoolean("ok") : ""));
+        if ("req".equals(type) && controlStream > 0) {
+            sendControl(new JSONObject()
+                    .put("type", "res")
+                    .put("id", m.opt("id") == null ? JSONObject.NULL : m.opt("id"))
+                    .put("ok", false)
+                    .put("error", new JSONObject()
+                            .put("code", "unsupported")
+                            .put("message", "not supported on this device")));
+            log("control: replied unsupported to " + (method.isEmpty() ? "req" : method));
+        }
     }
 
     private int openStream(String verb, String path, String[] headers,
@@ -265,6 +414,7 @@ public final class GadgetClient {
         wsSend(noise.encrypt(GadgetProto.encodeTransportFrame(env)));
         return sid;
     }
+
 
     // ---------------- chat ----------------
     /**
@@ -283,29 +433,43 @@ public final class GadgetClient {
     }
 
     /**
-     * 流式版本: 增量文字里遇到句末标点(。！？!?；; 换行…), 或超过约 40 字遇到逗号, 就切出一句交给
-     * listener; message_done 时把剩余文字作为一句切出, 再等 MSG_DONE_GRACE_MS 没有新消息即结束;
-     * 文字静默 TEXT_QUIET_MS 也结束。返回整段文字(兜底/存历史用)。listener 可为 null(=整段接口)。
-     * 方法返回即"流结束"。
+     * 打断/新提问时调用(任意线程, 不需要锁): 正在读的流在 READ_SLICE_MS 内跳出并释放锁。
+     * 被打断的那轮服务端可能还在继续推文字, 跳出后会断开这条连接并在后台立即重连, 防止旧回答串到下一轮。
      */
-    public synchronized String chatStream(String systemPrompt, String historyText,
-                                          String userInput, SentenceListener listener) throws Exception {
-        if (sock == null || noise == null) {
-            connect();   // first turn (PhicommChatHandler only news the client)
-        }
-        // Muse 服务端自己保存会话上下文, 不再每轮重发人设和历史(提示词越长它想得越久)。
-        // 只在每条新连接的第一轮带上儿童规则 + 人设; historyText 不再使用。
+    public void cancelCurrent() {
+        cancelGen++;
+    }
+
+    private String buildMessage(boolean withPersona, String systemPrompt, String userInput) {
         StringBuilder sb = new StringBuilder();
-        boolean withPersona = !personaSent;
         if (withPersona) {
             sb.append(KID_RULES).append("\n");
             if (systemPrompt != null && !systemPrompt.isEmpty())
                 sb.append(systemPrompt).append("\n");
-            sb.append("\n小朋友说: ");
         }
-        sb.append(userInput);
+        sb.append(KID_RULE_SHORT).append("\n小朋友说: ").append(userInput);
+        return sb.toString();
+    }
+
+    /**
+     * 流式版本: 增量文字里遇到句末标点(。！？!?；; 换行…), 或超过约 40 字遇到逗号, 就切出一句交给
+     * listener; message_done 时把剩余文字作为一句切出, 再等 MSG_DONE_GRACE_MS 没有新消息即结束;
+     * 文字静默 TEXT_QUIET_MS 也结束。返回整段文字(兜底/存历史用)。listener 可为 null(=整段接口)。
+     * 方法返回即"流结束"。chat/stream 4 秒无响应 -> 重连重问一次; 首字 20s / 整轮 40s 没有任何句子
+     * -> 抛 ReplyTimeout; cancelCurrent() -> 立即返回已有部分。
+     */
+    public synchronized String chatStream(String systemPrompt, String historyText,
+                                          String userInput, SentenceListener listener) throws Exception {
+        final int myGen = cancelGen;
+        if (sock == null || noise == null) {
+            connect();   // first turn / keep-alive 还没连上
+        }
+        if (cancelGen != myGen) return "";
+        // Muse 服务端自己保存会话上下文, 不再每轮重发人设和历史(提示词越长它想得越久)。
+        // 每条新连接的第一轮带完整儿童规则 + 人设; 之后每轮只带一句短规则。historyText 不再使用。
+        boolean withPersona = !personaSent;
         JSONObject req = new JSONObject()
-                .put("message", sb.toString())
+                .put("message", buildMessage(withPersona, systemPrompt, userInput))
                 .put("output_modality", "text");
         if (creds != null) req.put("device_id", creds.nodeId());
         byte[] body = req.toString().getBytes(StandardCharsets.UTF_8);
@@ -314,33 +478,55 @@ public final class GadgetClient {
             // 上一轮结束后连接上可能还挂着它的 message_done / 状态事件 / 后续消息;
             // 先读掉丢弃, 免得这一轮把上一轮的残余当成回复。
             drainPending();
-            String r = doChat(body, ss);
+            String r = doChat(body, ss, myGen);
             if (withPersona) personaSent = true;
             return r;
+        } catch (ReplyTimeout e) {
+            log("reply timeout (" + e.getMessage() + "), drop connection, reconnect in background");
+            dropAndReconnectInBackground();
+            throw e;
         } catch (Exception e) {
             if (ss.emitted > 0) {
-                // 已经播出去的句子不能再重问一遍(会重复播报): 保留已有部分, 断开连接下轮重连
+                // 已经播出去的句子不能再重问一遍(会重复播报): 保留已有部分, 断开连接后台重连
                 log("stream broken after " + ss.emitted + " sentence(s), keep partial: " + e);
-                close();
                 ss.flushRemainder();
+                dropAndReconnectInBackground();
                 if (withPersona) personaSent = true;
                 return ss.all.toString().trim();
             }
-            log("chat failed, reconnect once: " + e);
-            connect();           // one reconnect attempt (covers IO + protocol errors)
-            subBuf.reset();
-            {   // 新连接 = 新会话: 重新带上人设
-                StringBuilder sb2 = new StringBuilder(KID_RULES).append("\n");
-                if (systemPrompt != null && !systemPrompt.isEmpty()) sb2.append(systemPrompt).append("\n");
-                sb2.append("\n小朋友说: ").append(userInput);
-                req.put("message", sb2.toString());
-                body = req.toString().getBytes(StandardCharsets.UTF_8);
+            if (cancelGen != myGen) {
+                log("chat failed after cancel, no retry: " + e);
+                dropAndReconnectInBackground();
+                return "";
             }
-            String r = doChat(body, new StreamState(listener));
-            personaSent = true;
-            return r;
+            log("chat failed, reconnect once: " + e);
+            long t0 = System.currentTimeMillis();
+            connect();           // one reconnect attempt (covers IO + protocol errors)
+            log("chat reconnect done in " + (System.currentTimeMillis() - t0) + " ms, ask again");
+            if (cancelGen != myGen) return "";
+            // 新连接 = 新会话: 重新带上人设
+            req.put("message", buildMessage(true, systemPrompt, userInput));
+            body = req.toString().getBytes(StandardCharsets.UTF_8);
+            try {
+                String r = doChat(body, new StreamState(listener), myGen);
+                personaSent = true;
+                return r;
+            } catch (ReplyTimeout te) {
+                log("reply timeout after reconnect (" + te.getMessage() + ")");
+                dropAndReconnectInBackground();
+                throw te;
+            }
         }
     }
+
+    /** 持有锁调用: 关掉当前连接, 让保活线程马上在锁外重连。 */
+    private void dropAndReconnectInBackground() {
+        closeQuiet();
+        reconnectNow = true;
+        Thread t = keepAliveThread;
+        if (t != null) t.interrupt();
+    }
+
 
     // ---------------- sentence splitting ----------------
     /** 句末标点: 遇到就切 */
@@ -432,7 +618,7 @@ public final class GadgetClient {
         }
     }
 
-    private String doChat(byte[] body, StreamState ss) throws Exception {
+    private String doChat(byte[] body, StreamState ss, int myGen) throws Exception {
         chatStream = openStream("POST", "/chat/stream",
                 new String[]{"Content-Type", "application/json",
                         "x-request-id", java.util.UUID.randomUUID().toString(),
@@ -440,6 +626,9 @@ public final class GadgetClient {
         long startedAt = System.currentTimeMillis();
         ss.startedAt = startedAt;
         long deadline = startedAt + REPLY_TIMEOUT_MS;
+        long httpDeadline = startedAt + HTTP_RESP_TIMEOUT_MS;
+        long firstTextDeadline = startedAt + FIRST_TEXT_TIMEOUT_MS;
+        boolean gotHttp = false;                   // chat/stream 的 HTTP 响应(或任何本轮事件)已到
         StringBuilder cur = new StringBuilder();   // 当前这条消息已收到的增量文字
         boolean sawDelta = false;                  // 本轮收到过 text_append(之后不再采用整条消息文字, 防重复)
         boolean inTurn = false;
@@ -448,16 +637,34 @@ public final class GadgetClient {
 
         while (true) {
             long now = System.currentTimeMillis();
+            if (cancelGen != myGen) {
+                endReason = "cancelled";
+                log("stream cancelled after " + (now - startedAt) + " ms (sentences=" + ss.emitted
+                        + "), release lock, reconnect in background");
+                dropAndReconnectInBackground();   // 服务端可能还在推这一轮, 不能留在连接上串到下一轮
+                break;
+            }
+            if (!gotHttp && now >= httpDeadline) {
+                throw new IOException("chat/stream no response in " + HTTP_RESP_TIMEOUT_MS + " ms");
+            }
+            if (ss.all.length() == 0 && now >= firstTextDeadline) {
+                if (ss.emitted == 0)
+                    throw new ReplyTimeout("no text in " + FIRST_TEXT_TIMEOUT_MS + " ms");
+                break;
+            }
             // Hard deadline: always exit, never hang (method is synchronized).
-            // Return whatever text arrived (may be partial or empty).
-            if (now >= deadline) break;
+            if (now >= deadline) {
+                if (ss.emitted == 0 && ss.buf.toString().trim().isEmpty())
+                    throw new ReplyTimeout("no sentence in " + REPLY_TIMEOUT_MS + " ms");
+                break;
+            }
             if (inTurn && quietUntil > 0 && now >= quietUntil) break;
-            long wait = Math.min(5_000, deadline - now);
+            long wait = Math.min(READ_SLICE_MS, deadline - now);
             if (inTurn && quietUntil > 0) wait = Math.min(wait, quietUntil - now);
-            sock.setSoTimeout((int) Math.max(100, wait));
+            sock.setSoTimeout((int) Math.max(50, wait));
             byte[] frame;
             try {
-                frame = wsRecv();
+                frame = wsRecv();   // 只会在帧首字节之前超时; 帧读到一半不会丢字节
             } catch (java.net.SocketTimeoutException e) {
                 continue;
             }
@@ -478,14 +685,15 @@ public final class GadgetClient {
                 continue;
             }
             if (sf.streamId == controlStream) {
-                log("control: " + (sf.isResponse ? "resp " + sf.status + " " : "")
-                        + preview(sf.body));
+                handleControl(sf);
                 continue;
             }
             if (sf.streamId == chatStream) {
                 if (sf.isReset) throw new IOException("chat stream reset by server");
                 if (sf.isResponse) {
-                    log("chat/stream HTTP " + sf.status + " " + preview(sf.body));
+                    gotHttp = true;
+                    log("chat/stream HTTP " + sf.status + " after " + (System.currentTimeMillis() - startedAt)
+                            + " ms " + preview(sf.body));
                     if (sf.status >= 400) throw new IOException("chat/stream HTTP " + sf.status);
                 }
                 continue;
@@ -518,8 +726,12 @@ public final class GadgetClient {
                     JSONObject payload = ev.optJSONObject("payload");
                     if (payload == null) payload = new JSONObject();
                     log("event " + name);
-                    if ("user".equals(payload.optString("role", ""))) continue;
+                    if ("user".equals(payload.optString("role", ""))) {
+                        gotHttp = true;   // 服务端已收到本轮问题(回显), 连接是活的
+                        continue;
+                    }
                     if ("agent.status".equals(name) || "task.status".equals(name)) {
+                        gotHttp = true;
                         // 状态事件只记日志(截断 160 字); 是否收尾只看文字静默 / message_done
                         String st = payload.toString();
                         log(name + " " + (st.length() > 160 ? st.substring(0, 160) : st));
@@ -528,6 +740,7 @@ public final class GadgetClient {
                     if ("delta.text_append".equals(name)) {
                         String t = payload.optString("text", "");
                         if (!t.isEmpty()) {
+                            gotHttp = true;
                             if (ss.all.length() == 0)
                                 log("first text after " + (System.currentTimeMillis() - startedAt) + " ms");
                             inTurn = true;
@@ -539,6 +752,7 @@ public final class GadgetClient {
                         }
                     } else if ("delta.message_done".equals(name)
                             || "message.assistant".equals(name)) {
+                        gotHttp = true;
                         String txt = payload.optString("display_text", "");
                         if (txt.isEmpty()) {
                             JSONArray items = payload.optJSONArray("content");
@@ -576,18 +790,19 @@ public final class GadgetClient {
             if (start < buf.length) subBuf.write(buf, start, buf.length - start);
         }
         // Flush any partial message (e.g. deadline / quiet hit mid-message).
-        ss.flushRemainder();
+        if (!"cancelled".equals(endReason)) ss.flushRemainder();
         String out = ss.all.toString().trim();
         log("stream end (" + endReason + "): sentences=" + ss.emitted + " chars=" + out.length()
                 + " in " + (System.currentTimeMillis() - startedAt) + " ms");
         return out;
     }
 
+
     // ---------------- warm-up / keep-alive ----------------
     /**
      * 开机后台调用: 提前连好 Muse, 之后每 25 秒发一次 WS ping 并把空闲期间服务器推来的
-     * 事件读掉(必须按顺序解密, 否则 Noise nonce 会错位)。连接断了就重连, 顺便按时刷新令牌。
-     * 这样问话时不用再花 ~10 秒建连。
+     * 事件读掉(必须按顺序解密, 否则 Noise nonce 会错位)。连续 2 次 ping 都没有任何回包(服务器回过 pong
+     * 才启用这条判断)就重连; 网络恢复/打断后被 interrupt 立即重连。建连在对象锁外进行, 不挡对话。
      */
     public synchronized void startKeepAlive() {
         if (keepAliveThread != null) return;
@@ -599,11 +814,12 @@ public final class GadgetClient {
                 while (keepAliveRunning) {
                     boolean ok = tick();
                     long sleep = ok ? KEEPALIVE_MS : backoff;
-                    backoff = ok ? 5_000 : Math.min(backoff * 2, 300_000);
+                    backoff = ok ? 5_000 : Math.min(backoff * 2, MAX_BACKOFF_MS);
                     try {
                         Thread.sleep(sleep);
                     } catch (InterruptedException e) {
-                        return;
+                        if (!keepAliveRunning) return;
+                        backoff = 5_000;   // 网络恢复 / 需要立即重连: 马上再来一轮
                     }
                 }
             }
@@ -612,22 +828,118 @@ public final class GadgetClient {
         keepAliveThread.start();
     }
 
-    private synchronized boolean tick() {
+    private boolean tick() {
         try {
-            if (creds != null) creds.refreshIfDue();
-            if (sock == null || noise == null) {
-                long t0 = System.currentTimeMillis();
-                connect();
-                log("warm connect ok in " + (System.currentTimeMillis() - t0) + " ms");
-                return true;
+            if (creds != null) creds.refreshIfDue();   // DeviceCredentials 自己同步, 不占本对象锁
+            boolean need;
+            int gen;
+            synchronized (this) {
+                if (reconnectNow) {
+                    reconnectNow = false;
+                    if (sock != null) {
+                        log("keep-alive: reconnect requested, drop current connection");
+                        closeQuiet();
+                    }
+                }
+                if (sock != null && noise != null) {
+                    long now = System.currentTimeMillis();
+                    if (lastPingAt > 0 && lastRxAt < lastPingAt) missedPongs++;
+                    else missedPongs = 0;
+                    if (pongSeen && missedPongs >= 2) {
+                        log("keep-alive: no pong for " + missedPongs + " pings ("
+                                + ((now - lastRxAt) / 1000) + "s silent), reconnect");
+                        closeQuiet();
+                    } else {
+                        wsPing();
+                        lastPingAt = System.currentTimeMillis();
+                        drainIdle();
+                        return true;
+                    }
+                }
+                need = true;
+                gen = connGen;
             }
-            wsPing();
-            drainIdle();
+            if (need) {
+                long t0 = System.currentTimeMillis();
+                Conn c = openConn();   // 不持有对象锁: 对话线程此时可以照常用/自己建连
+                synchronized (this) {
+                    if (connGen != gen && sock != null) {
+                        c.closeQuiet();
+                        log("warm connect: chat already reconnected, drop spare connection");
+                        return true;
+                    }
+                    install(c);
+                }
+                log("warm connect ok in " + (System.currentTimeMillis() - t0) + " ms");
+            }
             return true;
         } catch (Exception e) {
             log("keep-alive failed, will reconnect: " + e);
-            close();
+            synchronized (this) {
+                closeQuiet();
+            }
             return false;
+        }
+    }
+
+    // ---------------- network change ----------------
+    /**
+     * 注册 CONNECTIVITY_CHANGE: 断网立即关掉连接(正在等回复的对话马上失败回落, 不再干等);
+     * 网络恢复 / 换网络立即在后台重连。只需调用一次。
+     */
+    public void watchNetwork(android.content.Context context) {
+        if (context == null) return;
+        try {
+            android.content.BroadcastReceiver r = new android.content.BroadcastReceiver() {
+                @Override
+                public void onReceive(android.content.Context c, android.content.Intent intent) {
+                    try {
+                        android.net.ConnectivityManager cm = (android.net.ConnectivityManager)
+                                c.getSystemService(android.content.Context.CONNECTIVITY_SERVICE);
+                        android.net.NetworkInfo ni = cm == null ? null : cm.getActiveNetworkInfo();
+                        boolean up = ni != null && ni.isConnected();
+                        String key = up ? ni.getType() + "/" + ni.getExtraInfo() : "";
+                        onNetworkChange(up, key, isInitialStickyBroadcast());
+                    } catch (Throwable t) {
+                        log("network receiver error: " + t);
+                    }
+                }
+            };
+            context.getApplicationContext().registerReceiver(r,
+                    new android.content.IntentFilter(android.net.ConnectivityManager.CONNECTIVITY_ACTION));
+            log("network watcher registered");
+        } catch (Throwable t) {
+            log("network watcher register failed: " + t);
+        }
+    }
+
+    private void onNetworkChange(boolean up, String key, boolean initial) {
+        Boolean prev = lastNetUp;
+        String prevKey = lastNetKey;
+        lastNetUp = up;
+        lastNetKey = key;
+        if (initial || prev == null) return;
+        if (!up) {
+            if (prev) {
+                log("network down: drop Muse connection now");
+                abortSocket();
+            }
+            return;
+        }
+        if (!prev || !key.equals(prevKey)) {
+            log("network up (" + (prev ? "changed" : "restored") + "): reconnect Muse now");
+            reconnectNow = true;
+            abortSocket();
+            Thread t = keepAliveThread;
+            if (t != null) t.interrupt();
+        }
+    }
+
+    /** 不拿锁直接关 socket: 正阻塞在读上的线程立即出异常, 它自己会清理并重连。 */
+    private void abortSocket() {
+        Socket s = sock;
+        if (s != null) {
+            try { s.close(); } catch (IOException ignored) { }
         }
     }
 
@@ -638,29 +950,34 @@ public final class GadgetClient {
         out.flush();
     }
 
-    /** 读掉空闲期间的帧(解密以保持 nonce 同步), 内容丢弃。 */
+    /** 读掉空闲期间的帧(解密以保持 nonce 同步), 内容丢弃; 控制流请求照常回复。最多 2 秒。 */
     private void drainIdle() throws Exception {
+        long t0 = System.currentTimeMillis();
         sock.setSoTimeout(500);
-        while (true) {
+        while (System.currentTimeMillis() - t0 < 2_000) {
             byte[] frame;
             try {
                 frame = wsRecv();
             } catch (java.net.SocketTimeoutException e) {
                 break;
             }
-            byte[] plain = noise.decrypt(frame);
-            try {
-                byte[] whole = reasm.feed(plain);
-                if (whole != null) {
-                    GadgetProto.ServerFrame sf = GadgetProto.decodeServiceResponse(whole);
-                    if (sf.isReset && (sf.streamId == subStream || sf.streamId == controlStream))
-                        throw new IOException("stream " + sf.streamId + " reset while idle");
-                }
-            } catch (IllegalArgumentException ignored) {
-            }
+            dispatchIdleFrame(noise.decrypt(frame));
             sock.setSoTimeout(300);
         }
         subBuf.reset();
+    }
+
+    /** 空闲期间收到的帧: 控制流交给 handleControl, 订阅流/控制流被重置则抛出(触发重连), 其余丢弃。 */
+    private void dispatchIdleFrame(byte[] plain) throws IOException {
+        try {
+            byte[] whole = reasm.feed(plain);
+            if (whole == null) return;
+            GadgetProto.ServerFrame sf = GadgetProto.decodeServiceResponse(whole);
+            if (sf.isReset && (sf.streamId == subStream || sf.streamId == controlStream))
+                throw new IOException("stream " + sf.streamId + " reset while idle");
+            if (sf.streamId == controlStream && !sf.isReset) handleControl(sf);
+        } catch (IllegalArgumentException ignored) {
+        }
     }
 
     /**
@@ -681,16 +998,7 @@ public final class GadgetClient {
                     break;
                 }
                 frames++;
-                byte[] plain = noise.decrypt(frame);
-                try {
-                    byte[] whole = reasm.feed(plain);
-                    if (whole != null) {
-                        GadgetProto.ServerFrame sf = GadgetProto.decodeServiceResponse(whole);
-                        if (sf.isReset && (sf.streamId == subStream || sf.streamId == controlStream))
-                            throw new IOException("stream " + sf.streamId + " reset while idle");
-                    }
-                } catch (IllegalArgumentException ignored) {
-                }
+                dispatchIdleFrame(noise.decrypt(frame));
             }
         } finally {
             subBuf.reset();
@@ -700,8 +1008,14 @@ public final class GadgetClient {
     }
 
     public synchronized void close() {
+        closeQuiet();
+    }
+
+    /** 持有锁(或建连前)调用 */
+    private void closeQuiet() {
+        Socket s = sock;
         try {
-            if (sock != null) sock.close();
+            if (s != null) s.close();
         } catch (IOException ignored) {
         }
         sock = null;
@@ -712,6 +1026,10 @@ public final class GadgetClient {
     private final java.security.SecureRandom maskRnd = new java.security.SecureRandom();
 
     private void wsSend(byte[] payload) throws IOException {
+        wsSend(out, payload);
+    }
+
+    private void wsSend(OutputStream o, byte[] payload) throws IOException {
         ByteArrayOutputStream h = new ByteArrayOutputStream();
         h.write(0x82);
         int n = payload.length;
@@ -723,71 +1041,111 @@ public final class GadgetClient {
             h.write(n & 0xFF);
         } else {
             h.write(0x80 | 127);
-            for (int i = 7; i >= 0; i--) h.write((int) ((n >>> (8 * i)) & 0xFF));
+            for (int i = 7; i >= 0; i--) h.write((int) ((((long) n) >>> (8 * i)) & 0xFF));
         }
         byte[] mask = new byte[4];
         maskRnd.nextBytes(mask);
         h.write(mask, 0, 4);
         byte[] masked = new byte[n];
         for (int i = 0; i < n; i++) masked[i] = (byte) (payload[i] ^ mask[i % 4]);
-        out.write(h.toByteArray());
-        out.write(masked);
-        out.flush();
+        o.write(h.toByteArray());
+        o.write(masked);
+        o.flush();
     }
 
-    /** Read one full message; handles fragmentation, answers ping. */
     private byte[] wsRecv() throws IOException {
+        Socket s = sock;
+        if (s == null) throw new EOFException("not connected");
+        return wsRecv(s, in, out);
+    }
+
+    /**
+     * Read one full message; handles fragmentation, answers ping.
+     * 只允许在"一个消息的第一帧的首字节之前"按调用方设置的读超时抛 SocketTimeoutException(什么都没读,
+     * 不丢字节); 一旦读到首字节, 剩余部分改用 MID_FRAME_TIMEOUT_MS 读完, 中途超时视为连接坏了
+     * (抛普通 IOException, 不会被调用方当成"暂时没数据"而 continue, 避免帧错位)。
+     */
+    private byte[] wsRecv(Socket s, InputStream i, OutputStream o) throws IOException {
         ByteArrayOutputStream msg = new ByteArrayOutputStream();
-        while (true) {
-            byte[] hdr = readFully(2);
-            boolean fin = (hdr[0] & 0x80) != 0;
-            int opcode = hdr[0] & 0x0F;
-            boolean masked = (hdr[1] & 0x80) != 0;
-            long len = hdr[1] & 0x7F;
-            if (len == 126) {
-                byte[] e = readFully(2);
-                len = ((e[0] & 0xFF) << 8) | (e[1] & 0xFF);
-            } else if (len == 127) {
-                byte[] e = readFully(8);
-                len = 0;
-                for (byte b : e) len = (len << 8) | (b & 0xFF);
+        int callerTimeout = s.getSoTimeout();
+        boolean extended = false;    // 已切到帧中途的长超时
+        boolean inMessage = false;   // 已收到非 fin 的数据帧(分片消息中途)
+        try {
+            while (true) {
+                int b0 = i.read();   // 帧首字节: 不在消息中途时允许超时
+                if (b0 < 0) throw new EOFException("connection closed");
+                if (!extended) {
+                    s.setSoTimeout(MID_FRAME_TIMEOUT_MS);
+                    extended = true;
+                }
+                int b1 = readFully(i, 1)[0] & 0xFF;
+                boolean fin = (b0 & 0x80) != 0;
+                int opcode = b0 & 0x0F;
+                boolean masked = (b1 & 0x80) != 0;
+                long len = b1 & 0x7F;
+                if (len == 126) {
+                    byte[] e = readFully(i, 2);
+                    len = ((e[0] & 0xFF) << 8) | (e[1] & 0xFF);
+                } else if (len == 127) {
+                    byte[] e = readFully(i, 8);
+                    len = 0;
+                    for (byte b : e) len = (len << 8) | (b & 0xFF);
+                }
+                byte[] mask = masked ? readFully(i, 4) : null;
+                if (len > 8 * 1024 * 1024) throw new IOException("ws frame too large");
+                byte[] data = readFully(i, (int) len);
+                if (masked) {
+                    for (int k = 0; k < data.length; k++) data[k] ^= mask[k % 4];
+                }
+                lastRxAt = System.currentTimeMillis();
+                if (opcode == 0x8) throw new EOFException("server closed websocket");
+                if (opcode == 0x9 || opcode == 0xA) {
+                    if (opcode == 0x9) {  // ping -> pong
+                        ByteArrayOutputStream p = new ByteArrayOutputStream();
+                        p.write(0x8A);
+                        p.write(0x80 | data.length);
+                        byte[] m = new byte[4];
+                        maskRnd.nextBytes(m);
+                        p.write(m, 0, 4);
+                        for (int k = 0; k < data.length; k++) data[k] ^= m[k % 4];
+                        o.write(p.toByteArray());
+                        o.write(data);
+                        o.flush();
+                    } else if (!pongSeen) {
+                        pongSeen = true;   // 服务器会回 pong: 之后启用"2 次无 pong 重连"
+                        log("keep-alive: server answers ping");
+                    }
+                    if (!inMessage) {      // 控制帧之间回到帧边界: 恢复调用方超时
+                        s.setSoTimeout(callerTimeout);
+                        extended = false;
+                    }
+                    continue;
+                }
+                if (opcode == 0x2 || opcode == 0x0) msg.write(data, 0, data.length);
+                if (fin) return msg.toByteArray();
+                inMessage = true;
             }
-            byte[] mask = masked ? readFully(4) : null;
-            if (len > 8 * 1024 * 1024) throw new IOException("ws frame too large");
-            byte[] data = readFully((int) len);
-            if (masked) {
-                for (int i = 0; i < data.length; i++) data[i] ^= mask[i % 4];
+        } catch (java.net.SocketTimeoutException e) {
+            if (extended) throw new IOException("ws frame stalled mid-frame (" + MID_FRAME_TIMEOUT_MS + " ms)");
+            throw e;
+        } finally {
+            if (extended) {
+                try { s.setSoTimeout(callerTimeout); } catch (IOException ignored) { }
             }
-            if (opcode == 0x8) throw new EOFException("server closed websocket");
-            if (opcode == 0x9) {  // ping -> pong
-                ByteArrayOutputStream p = new ByteArrayOutputStream();
-                p.write(0x8A);
-                p.write(0x80 | data.length);
-                byte[] m = new byte[4];
-                maskRnd.nextBytes(m);
-                p.write(m, 0, 4);
-                for (int i = 0; i < data.length; i++) data[i] ^= m[i % 4];
-                out.write(p.toByteArray());
-                out.write(data);
-                out.flush();
-                continue;
-            }
-            if (opcode == 0xA) continue;  // pong (answer to our keep-alive ping)
-            if (opcode == 0x2 || opcode == 0x0) msg.write(data, 0, data.length);
-            if (fin) return msg.toByteArray();
         }
     }
 
-    private byte[] readFully(int n) throws IOException {
+    private static byte[] readFully(InputStream i, int n) throws IOException {
         byte[] b = new byte[n];
         int off = 0;
         while (off < n) {
-            int r = in.read(b, off, n - off);
+            int r = i.read(b, off, n - off);
             if (r < 0) throw new EOFException("connection closed");
             off += r;
         }
         return b;
     }
+
 
     private static byte[] readHeaders(InputStream in) throws IOException {
         ByteArrayOutputStream h = new ByteArrayOutputStream();

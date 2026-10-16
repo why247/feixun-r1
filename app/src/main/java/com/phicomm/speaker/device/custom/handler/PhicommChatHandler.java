@@ -118,6 +118,8 @@ public class PhicommChatHandler extends SimpleUserEventInboundHandler<NLU> {
     private static final String FILLER_TEXT = "嗯，我想想";
     /** 兜底: 这么久还没收到「嗯，我想想」的结束事件就当它播完了 */
     private static final long FILLER_MAX_MS = 6000;
+    /** Muse 首字/整轮超时(没有任何句子)时的简短提示, 不再回落重问 */
+    private static final String SLOW_NET_TEXT = "网络有点慢，等会再问我吧";
     private final Object fillerLock = new Object();
     private boolean fillerPlaying = false;
     private long fillerStartedAt = 0;
@@ -152,6 +154,7 @@ public class PhicommChatHandler extends SimpleUserEventInboundHandler<NLU> {
             this.gadgetClient = new GadgetClient(creds);
             LogMgr.d(TAG, "Gadget: device credentials loaded, node=" + creds.nodeId());
             this.gadgetClient.startKeepAlive();   // 开机就连好 + 保活, 问话时不用再建连
+            this.gadgetClient.watchNetwork(context); // 断网立即放弃, 网络恢复立即重连
         } else {
             this.useGadget = gadgetToken != null && !gadgetToken.isEmpty();
             if (this.useGadget) {
@@ -271,6 +274,9 @@ public class PhicommChatHandler extends SimpleUserEventInboundHandler<NLU> {
 
     /** 新一轮唤醒/提问、打断、退出: 作废当前轮次, 清空队列。 */
     private void cancelStream(String why) {
+        // 正在读 Muse 流的线程立即跳出并释放锁(旧轮次的残余由 GadgetClient 断开重连处理)
+        GadgetClient gc = gadgetClient;
+        if (gc != null) gc.cancelCurrent();
         synchronized (streamLock) {
             if (streamActive || !sentenceQueue.isEmpty()) {
                 LogMgr.d(TAG, "stream turn " + streamTurn + " cancelled (" + why + "), drop "
@@ -556,6 +562,7 @@ public class PhicommChatHandler extends SimpleUserEventInboundHandler<NLU> {
                 isProcessingRequest = true;  // ⭐ 标记任务开始
                 try {
                     String response = null;
+                    boolean slowTip = false;         // Muse 超时: 只播「网络有点慢」
                     boolean streamHandled = false;   // 流式已接管播报(或本轮已作废), 不再走整段 playTTS
                     // v87: 豆包链可能随回复带回这条回答的语音(mp3), 有就用豆包自己的声音播
                     byte[] llmAudio = null;
@@ -733,6 +740,7 @@ public class PhicommChatHandler extends SimpleUserEventInboundHandler<NLU> {
                                         if (advanceStream(turn, "filler backstop")) runStreamFinalOnMain(turn);
                                     }
                                 }, FILLER_MAX_MS + 50);
+                                boolean gadgetTimedOut = false;
                                 try {
                                     response = gadgetClient.chatStream(
                                             activeSysPrompt, historyText, userInput,
@@ -742,6 +750,9 @@ public class PhicommChatHandler extends SimpleUserEventInboundHandler<NLU> {
                                                     offerSentence(turn, sentence);
                                                 }
                                             });
+                                } catch (GadgetClient.ReplyTimeout te) {
+                                    gadgetTimedOut = true;
+                                    LogMgr.e(TAG, "Gadget 超时(" + te.getMessage() + "), 播简短提示");
                                 } catch (Exception ge) {
                                     LogMgr.e(TAG, "Gadget 直连失败: " + ge);
                                 }
@@ -752,6 +763,11 @@ public class PhicommChatHandler extends SimpleUserEventInboundHandler<NLU> {
                                     llmAudio = null;
                                     llmAudioFormat = null;
                                     if (streamed < 0) LogMgr.d(TAG, "stream turn cancelled, skip playback");
+                                } else if (gadgetTimedOut) {
+                                    // 等了 20s/40s 还没开口: 不再回落另一个模型让孩子继续干等, 直接说一句提示
+                                    LogMgr.d(TAG, "timing: muse timeout -> slow-network tip");
+                                    response = null;
+                                    slowTip = true;
                                 } else if (response == null || response.isEmpty()) {
                                     LogMgr.e(TAG, "Gadget 无回复, 回落 OpenAI");
                                     // 直连失败/超时: 回落走 OpenAI 池(v91 三级降级)
@@ -792,6 +808,17 @@ public class PhicommChatHandler extends SimpleUserEventInboundHandler<NLU> {
                     
                     if (streamHandled) {
                         return;   // 句子队列负责播报和最后一句结束后的多轮 ASR
+                    }
+                    if (slowTip) {
+                        waitFillerDone();
+                        ctx.stopWakeup();
+                        ctx.stopASR();
+                        isMultiTurnMode = false;      // 提示完回到唤醒, 不进多轮
+                        conversationHistory = null;
+                        PlaybackStateMonitor.setTTSPlaying(false);
+                        currentResponse = SLOW_NET_TEXT;
+                        ctx.playTTS(SLOW_NET_TEXT);
+                        return;
                     }
                     // 「嗯，我想想」还没说完就等它说完再开口(不互相打断)
                     waitFillerDone();
