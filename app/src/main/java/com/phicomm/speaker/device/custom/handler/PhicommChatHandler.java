@@ -119,6 +119,23 @@ public class PhicommChatHandler extends SimpleUserEventInboundHandler<NLU> {
     
     // ⭐ 异步任务追踪标志,用于人格切换时等待任务完成
     private volatile boolean isProcessingRequest = false;
+    /**
+     * 请求代次: 每次新提问 +1, exit()/doInterrupt() 也 +1。后台大模型线程开播前比对,
+     * 不一致说明本轮已被打断/退出/新一轮取代, 结果直接丢弃(不再在主线程 sleep 忙等它结束)。
+     */
+    private volatile int chatGen = 0;
+
+    private synchronized int bumpChatGen() {
+        return ++chatGen;
+    }
+
+    /** 后台线程开播前调用: 本轮已作废返回 true 并记日志 */
+    private boolean staleChat(int gen, String where) {
+        int now = chatGen;
+        if (gen == now) return false;
+        LogMgr.d(TAG, "chat: drop stale reply gen " + gen + " (now " + now + ") at " + where);
+        return true;
+    }
 
     // 「嗯，我想想」: 调 Muse 前先说一句。它的 TTS 结束事件要吞掉(不能触发多轮 ASR /
     // handleTtsPlayingEnd), 正式回答等它说完再播(不互相打断丢字)。
@@ -615,6 +632,7 @@ public class PhicommChatHandler extends SimpleUserEventInboundHandler<NLU> {
 
         // 新一轮提问: 作废上一轮还没播完/还在路上的流式句子
         cancelStream("new question");
+        final int myGen = bumpChatGen();
 
         final String userInput = evt.getText();
         com.phicomm.speaker.device.custom.engine.VoiceTiming.intent("chat", userInput);
@@ -687,6 +705,7 @@ public class PhicommChatHandler extends SimpleUserEventInboundHandler<NLU> {
                             response = "好的,成语接龙游戏结束!你一共完成了 " + idiomGameTurn + " 轮对话,非常棒!";
                             
                             // 播报后退出游戏模式
+                            if (staleChat(myGen, "idiom exit")) return;
                             ctx.stopWakeup();
                             ctx.stopASR();
                             currentResponse = response;
@@ -757,6 +776,7 @@ public class PhicommChatHandler extends SimpleUserEventInboundHandler<NLU> {
                             response = "成功清理";
                             
                             // 停止唤醒和 ASR
+                            if (staleChat(myGen, "clear memory")) return;
                             ctx.stopWakeup();
                             ctx.stopASR();
                             
@@ -880,6 +900,8 @@ public class PhicommChatHandler extends SimpleUserEventInboundHandler<NLU> {
                     if (streamHandled) {
                         return;   // 句子队列负责播报和最后一句结束后的多轮 ASR
                     }
+                    // 本轮在等大模型期间被打断/退出/新一轮取代: 结果作废, 不播
+                    if (staleChat(myGen, "reply")) return;
                     if (slowTip) {
                         waitFillerDone();
                         ctx.stopWakeup();
@@ -921,7 +943,7 @@ public class PhicommChatHandler extends SimpleUserEventInboundHandler<NLU> {
                                         @Override
                                         public void onError(String error) {
                                             LogMgr.e(TAG, "豆包语音播放失败, 退回原厂 TTS: " + error);
-                                            if (currentResponse != null) {
+                                            if (currentResponse != null && !staleChat(myGen, "doubao fallback")) {
                                                 ctx.playTTS(currentResponse);
                                             }
                                         }
@@ -943,6 +965,7 @@ public class PhicommChatHandler extends SimpleUserEventInboundHandler<NLU> {
                 } catch (Exception e) {
                     LogMgr.e(TAG, "chat failed: " + e);
                     e.printStackTrace();
+                    if (staleChat(myGen, "error tip")) return;
                     waitFillerDone();
                     PlaybackStateMonitor.setTTSPlaying(false);
                     ctx.playTTS("我暂时连不上网络大脑，等一下再问我吧");
@@ -1098,17 +1121,8 @@ public class PhicommChatHandler extends SimpleUserEventInboundHandler<NLU> {
         // 取消超时定时器
         timeoutHandler.removeCallbacks(timeoutRunnable);
         
-        // ⭐ 等待异步大模型任务完成(最多等待2秒)
-        int waitCount = 0;
-        while (isProcessingRequest && waitCount < 20) {
-            try {
-                Thread.sleep(100);
-                waitCount++;
-            } catch (InterruptedException e) {
-                Thread.currentThread().interrupt();
-                break;
-            }
-        }
+        // 不再在主线程忙等后台大模型任务(原最多 sleep 2s): 代次 +1, 后台线程开播前发现作废自行丢弃
+        bumpChatGen();
         
         // 重置成语接龙状态
         isIdiomGameMode = false;
@@ -1126,6 +1140,8 @@ public class PhicommChatHandler extends SimpleUserEventInboundHandler<NLU> {
     public void doInterrupt(ANTHandlerContext ctx, String interruptType) {
         // 打断: 不管 eventReceived, 先作废流式轮次(清空队列, 丢弃之后到达的旧句子)
         cancelStream("interrupt " + interruptType);
+        // 本轮在途的大模型结果作废(后台线程开播前比对代次自行丢弃), 不在这里等它
+        bumpChatGen();
         // 打断处理
         if (eventReceived) {
             LogMgr.d(TAG, "doInterrupt, isIdiomGameMode=" + isIdiomGameMode +
@@ -1141,17 +1157,7 @@ public class PhicommChatHandler extends SimpleUserEventInboundHandler<NLU> {
             // 取消超时定时器
             timeoutHandler.removeCallbacks(timeoutRunnable);
             
-            // ⭐ 等待异步大模型任务完成(最多等待2秒)
-            int waitCount = 0;
-            while (isProcessingRequest && waitCount < 20) {
-                try {
-                    Thread.sleep(100);
-                    waitCount++;
-                } catch (InterruptedException e) {
-                    Thread.currentThread().interrupt();
-                    break;
-                }
-            }
+            // 不再在主线程忙等后台大模型任务(原最多 sleep 2s): 上面已 bumpChatGen, 后台线程开播前发现作废自行丢弃
             
             // 中断时退出成语接龙模式
             isIdiomGameMode = false;
