@@ -24,10 +24,10 @@ v65 / v67 出过的问题（`PhicommChatHandler.onASREventEngineInitDone` 把 `p
 git fetch
 git checkout night-opt
 git pull
-python build_from_java.py 71
+python build_from_java.py 76
 ```
 
-（`71` 是版本号，随便递增。）产物：`build_out\r1_v71.apk`。
+（`76` 是版本号，随便递增；当前 night-opt = v76。）产物：`build_out\r1_v76.apk`。
 
 脚本做的事：
 1. `original_v2/classes.dex` → dex2jar → `tools/base.jar`（原厂类当编译 classpath，去掉 custom/）
@@ -44,14 +44,14 @@ python build_from_java.py 71
 可选让脚本直接装：
 
 ```bat
-python build_from_java.py 71 --install 192.168.10.204:5555
+python build_from_java.py 76 --install 192.168.10.204:5555
 ```
 
 或手动：
 
 ```bat
 adb connect 192.168.10.204:5555
-adb push build_out\r1_v71.apk /sdcard/r1.apk
+adb push build_out\r1_v76.apk /sdcard/r1.apk
 adb shell "CLASSPATH=/system/framework/pm.jar app_process /system/bin com.android.commands.pm.Pm install -r /sdcard/r1.apk"
 adb reboot
 ```
@@ -61,7 +61,7 @@ adb reboot
 ## 看日志
 
 ```bat
-adb logcat -d -v time -s Gadget PhicommChat OpenAIClient MusicClient PhicommMusicSearch PostTeaser PersonaManager > r1.log
+adb logcat -d -v time -s Gadget PhicommChat OpenAIClient MusicClient PhicommMusicSearch PostTeaser PersonaManager NLUDispatcher NativeANTEngine > r1.log
 ```
 
 - `MusicClient: lossless ok src=kuwo-mobi q=flac` / `src=gd-netease q=flac(1411k)` → 正在放无损
@@ -93,6 +93,18 @@ adb logcat -d -v time -s Gadget PhicommChat OpenAIClient MusicClient PhicommMusi
   - `Gadget: stream: first sentence ready after …ms (len=N)` → v74 起第一句只要有句末标点且有效字≥1 就切(「好的！」不再被扣留), len 可能很小; 第二句起仍需≥4 个有效字
   - `Gadget: event delta.text_append (first of turn; rest not logged)` → 每轮只记首个文字碎片事件; `Gadget: stream end (…): text_append=N sentences=M …` → 本轮碎片总数
   - `NativeANTEngine: doStopWakeup isWakeUp:true|false`(紧挨 `stream: speak first sentence`) → 等 Muse 期间唤醒是否在跑(true=期间可喊「小爱同学」打断, 首句开播时才停)
+- v76 新日志关键词(v75 腾讯识别已整体撤回, 没有 TencentASR 了):
+  - `NLUDispatcher: early control (local score=… | net partial last=true) text=暂停 -> cn.yunzhisheng.setting.mp dispatch now, +…ms since recording start` → 控制词不等 VAD/云端, 本地结果一到就执行(期望 +1.4s 左右, 原来要等 VAD 到 5s)
+  - `NLUDispatcher: early control: drop late local|net result / late error … of handled turn` → 提前分发后同一轮迟到的结果被吞掉(正常)
+  - `NLUDispatcher: onASREventRecordingStop after early control -> no watchdog` → 提前分发后不挂 8s 卡死看门狗; 之后不应再出现 `[WATCHDOG] recognition stalled`
+  - `PhicommMusicSearch: control pause: silent (no TTS) -> wakeup` → 暂停/停止静默, 不再有 `doPlayTTS:好的`; 紧接着能再喊「小爱同学」= 唤醒正常
+  - `PhicommMusicSearch: VAD back sil 800 -> 700ms (asr)` → 唤醒后识别尾点(全局)已调; 若出现孩子说长句被截断, 反馈
+  - `NLUDispatcher: ignore benign error -65806 (wakeup word already active), no TTS` → 开机不再播「Emm，我暂时还不会」
+  - 点歌: `MusicClient: warm-up: dns kuwo …ms` / `warm-up: gd http 301 …ms, dns mobi.kuwo.cn …ms` / `PhicommMusicSearch: timing: prewarm (intent|boot) done in …ms` → 预热
+  - `MusicClient: gd timing: search …ms` / `gd timing: url …ms` → GD 台两步各自耗时(第二步应明显快 = 连接复用生效)
+  - `PhicommMusicSearch: first track: mp3 ready in …ms, lossless pending -> announce early` → 曲目已确定, 先播报; 随后 `timing: lossless ready …ms after intent -> switch buffer to lossless (during TTS|TTS already ended)` 或 `timing: lossless miss|timeout … -> keep mp3`
+  - `TTS end, lossless still resolving -> wait (mp3 buffered as fallback)` → 播报完无损还没到, 在等; `first track: lossless ok in …ms (parallel with mp3)` / `lossless miss, mp3 ok` / `mp3 miss, lossless ok` → 并行结果
+  - 对比 v74: `timing: resolved …ms after intent -> announce`(应提前) 和 `timing: music playing …ms after intent`(应缩短)
 
 ## QQ 音乐会员（可选）
 
