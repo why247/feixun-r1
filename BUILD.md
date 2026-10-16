@@ -24,10 +24,10 @@ v65 / v67 出过的问题（`PhicommChatHandler.onASREventEngineInitDone` 把 `p
 git fetch
 git checkout night-opt
 git pull
-python build_from_java.py 77
+python build_from_java.py 78
 ```
 
-（`77` 是版本号，随便递增；当前 night-opt = v77。）产物：`build_out\r1_v77.apk`。
+（`78` 是版本号，随便递增；当前 night-opt = v78。）产物：`build_out\r1_v78.apk`。
 
 脚本做的事：
 1. `original_v2/classes.dex` → dex2jar → `tools/base.jar`（原厂类当编译 classpath，去掉 custom/）
@@ -44,14 +44,14 @@ python build_from_java.py 77
 可选让脚本直接装：
 
 ```bat
-python build_from_java.py 77 --install 192.168.10.204:5555
+python build_from_java.py 78 --install 192.168.10.204:5555
 ```
 
 或手动：
 
 ```bat
 adb connect 192.168.10.204:5555
-adb push build_out\r1_v77.apk /sdcard/r1.apk
+adb push build_out\r1_v78.apk /sdcard/r1.apk
 adb shell "CLASSPATH=/system/framework/pm.jar app_process /system/bin com.android.commands.pm.Pm install -r /sdcard/r1.apk"
 adb reboot
 ```
@@ -111,6 +111,12 @@ adb logcat -d -v time -s Gadget PhicommChat OpenAIClient MusicClient PhicommMusi
   - `NLUDispatcher: unicar609: clean net_nlu (no uniCarRet) #k` → 生效(前 5 句各一行); onResult 里不应再有 `uniCarRet`, 第一条 partial 也不再是 609 错误串
   - `NLUDispatcher: unicar609: uniCarRet still in result (turn #k) -> reapply wx_service=false` → 原厂(TTS init done 后 NativeANTEngine.b())又把它置回 true, 已重新关; 若每轮都出现 = 设置没生效, 反馈
   - 对比: `timing: ASR recording stop` → `net_nlu` 到达(v74 为 173~566ms, 主要是云知声 nluProcessTime 88~392ms, 与 609 无关, 预计变化 ≈0)
+
+- v78 新日志关键词:
+  - 点歌慢失败: `MusicClient: kuwo-mobi: net fail after …ms -> breaker open, skip mobi for the rest of this song` → 车机 FLAC 接口超时/连不上(单独超时 3.5s 连接 / 5s 读), 本次点歌剩余候选不再试它; `kuwo-mobi: breaker open (net fail earlier this song) -> skip mobi` → 被跳过的候选(直接走 GD); 新点歌复位。GD 超时不变(5s/8s), 酷我 MP3/搜索连接超时 8s→4s
+  - QQ 优先: `PhicommMusicSearch: timing: prewarm (intent) skipped, qq on` → QQ 可用时点歌不再并发做酷我 DNS 预热; `first track: late qq #k ok in …ms (during fallback step #i) -> use qq` → QQ 3s 预算后迟到的 QQ 直链在酷我链跑的途中就被选用; 随后可能有 `qq miss -> kuwo chain abandoned` / `lossless abandoned (caller cancelled)`(放弃的酷我链, 正常)
+  - 打断历史: `PhicommChat: history: saved full turn …(all spoken|already spoken)` / `history: saved interrupted turn len=…(new question|interrupt …|exit|cancelled before stream end)` → 打断时本地历史记「已说出的半截 + （被打断）」; `history: turn interrupted before any sentence spoken, not saved`(本地历史只给 OpenAI 回落用)
+  - Gadget 打断后重连: 不应再看到打断后紧跟两次 `Noise XX handshake done`(串行两条连接)和随后的 `keep-alive: reconnect requested, drop current connection`; 对话线程等后台连接看 `chat waited …ms for background connect (ready)`(上限 20s), 自己建连看 `chat: connect now (pending background reconnect taken over)`
 
 ## QQ 音乐会员（可选）
 
