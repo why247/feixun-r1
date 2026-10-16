@@ -371,6 +371,7 @@ public class PhicommMusicSearchHandler extends SimpleUserEventInboundHandler<NLU
         
         // 异步搜索 + 播放（网络操作不能在主线程）; 解析出直链后播报「为您播放…」, 播报期间缓冲
         final int sg = ++searchGen;
+        musicClient.newResolveRound();   // v78: 车机 FLAC 单首歌内熔断按点歌复位
         intentAt = System.currentTimeMillis();
         firstStartLogged = false;
         prewarmAsync("intent");   // v76: 与搜索并行做 DNS / GD 台 TLS 预热, 首曲解析直接复用连接

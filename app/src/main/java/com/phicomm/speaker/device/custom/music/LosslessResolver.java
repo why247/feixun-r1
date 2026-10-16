@@ -55,6 +55,21 @@ public class LosslessResolver {
     private static final long GD_WINDOW_MS = 5 * 60 * 1000L;
     private static final int GD_BUDGET = 40;                       // 官方 50 次/5 分钟, 留余量
     private static final long KW_MOBI_BACKOFF_MS = 30 * 60 * 1000L;
+    /**
+     * v78: 车机接口单独的超时(GD 仍 5000/8000)。mobi 正常 0.2s 内回一个小 JSON; 原 5s 连接 + 8s 读,
+     * 接口死掉时每个候选白等 5~13s。连接 3500ms: Android 5.1 内核 SYN 初始 RTO 1s, 重传在 1s/3s,
+     * 3.5s 仍容得下第 3 个 SYN(丢包时还能连上), 2500 只剩 2 个; 读 5000ms: 健康但慢的服务器仍有余量。
+     */
+    private static final int MOBI_CONNECT_TIMEOUT = 3500;
+    private static final int MOBI_READ_TIMEOUT = 5000;
+    /** v78 单首歌内熔断: 本轮(一次点歌)mobi 第一次网络失败(超时/连不上)后, 剩余候选跳过 mobi 直接走 GD; 最长管这么久 */
+    private static final long MOBI_TRIP_MAX_MS = 60 * 1000L;
+    /** 点歌轮次(每次新点歌 +1, 见 newRound) */
+    private volatile int round = 0;
+    private int mobiTripRound = -1;
+    private long mobiTripAt = 0;
+    /** kuwoMobiFlac 本次是否网络层失败(只在 resolve 的锁内读写) */
+    private boolean mobiNetFail = false;
 
     private static final int CACHE_MAX = 100;
     // rid -> {url, label, expire}; 有界 LRU(插入顺序): 超了先清过期, 仍超淘汰最旧, 不再整体 clear
@@ -81,8 +96,20 @@ public class LosslessResolver {
         String label = null;
 
         // 1. 酷我车机 FLAC
-        if (now >= kwMobiDisabledUntil && kuwoRid != null) {
+        boolean tripped = mobiTripRound == round && now - mobiTripAt < MOBI_TRIP_MAX_MS;
+        if (tripped && now >= kwMobiDisabledUntil && kuwoRid != null) {
+            LogMgr.d(TAG, "kuwo-mobi: breaker open (net fail earlier this song) -> skip mobi: " + name);
+        }
+        if (!tripped && now >= kwMobiDisabledUntil && kuwoRid != null) {
+            long tm = System.currentTimeMillis();
+            mobiNetFail = false;
             url = kuwoMobiFlac(kuwoRid);
+            if (mobiNetFail) {
+                mobiTripRound = round;
+                mobiTripAt = System.currentTimeMillis();
+                LogMgr.d(TAG, "kuwo-mobi: net fail after " + (mobiTripAt - tm)
+                        + "ms -> breaker open, skip mobi for the rest of this song");
+            }
             if (url != null) {
                 label = "src=kuwo-mobi q=flac";
                 kwMobiFailStreak = 0;
@@ -119,7 +146,18 @@ public class LosslessResolver {
 
     private String kuwoMobiFlac(String kuwoRid) {
         String rid = kuwoRid.startsWith("MUSIC_") ? kuwoRid.substring(6) : kuwoRid;
-        String body = get(KW_MOBI + userId + "&rid=" + rid, false);
+        String body;
+        try {
+            body = getOnce(KW_MOBI + userId + "&rid=" + rid, false, MOBI_CONNECT_TIMEOUT, MOBI_READ_TIMEOUT);
+        } catch (java.io.IOException e) {
+            // 超时 / 连不上 / DNS 失败: 网络层失败, 触发本首歌内熔断(HTTP 非 200 不算, 服务器是活的)
+            mobiNetFail = true;
+            LogMgr.d(TAG, "kuwo-mobi get failed: " + e.getClass().getSimpleName());
+            return null;
+        } catch (Exception e) {
+            LogMgr.d(TAG, "kuwo-mobi get failed: " + e);
+            return null;
+        }
         if (body == null) return null;
         try {
             JSONObject o = new JSONObject(body);
@@ -141,6 +179,11 @@ public class LosslessResolver {
             LogMgr.d(TAG, "kuwo-mobi parse: " + e);
             return null;
         }
+    }
+
+    /** v78: 新的一次点歌开始(单首歌内熔断按轮次复位)。任意线程。 */
+    public void newRound() {
+        round++;
     }
 
     /** @return {url, 音质标签} */
@@ -319,21 +362,21 @@ public class LosslessResolver {
     private String get(String urlStr, boolean allowInsecureRetry) {
         if (allowInsecureRetry && gdRelaxedFirst) {
             try {
-                return getOnce(urlStr, true);
+                return getOnce(urlStr, true, CONNECT_TIMEOUT, READ_TIMEOUT);
             } catch (Exception e2) {
                 LogMgr.d(TAG, "get failed: " + e2);
                 return null;
             }
         }
         try {
-            return getOnce(urlStr, false);
+            return getOnce(urlStr, false, CONNECT_TIMEOUT, READ_TIMEOUT);
         } catch (SSLException e) {
             if (!allowInsecureRetry) return null;
             gdRelaxedFirst = true;
             // Android 5.1 信任库老; 这里只拿一个公开的播放直链, 不带任何凭证, 证书验不过就放宽重试一次
             LogMgr.d(TAG, "ssl failed (" + e.getMessage() + "), retry relaxed");
             try {
-                return getOnce(urlStr, true);
+                return getOnce(urlStr, true, CONNECT_TIMEOUT, READ_TIMEOUT);
             } catch (Exception e2) {
                 LogMgr.d(TAG, "get failed: " + e2);
                 return null;
@@ -344,7 +387,7 @@ public class LosslessResolver {
         }
     }
 
-    private String getOnce(String urlStr, boolean relaxed) throws Exception {
+    private String getOnce(String urlStr, boolean relaxed, int connectMs, int readMs) throws Exception {
         HttpURLConnection conn = (HttpURLConnection) new URL(urlStr).openConnection();
         boolean clean = false;   // v76: 响应体读到 EOF 并 close → 不 disconnect, 连接回池给下一次请求复用
         if (urlStr.startsWith(GD_ROOT)) lastGdNetAt = System.currentTimeMillis();
@@ -354,8 +397,8 @@ public class LosslessResolver {
             }
             conn.setRequestProperty("User-Agent", UA);
             conn.setRequestProperty("Accept", "application/json,*/*");
-            conn.setConnectTimeout(CONNECT_TIMEOUT);
-            conn.setReadTimeout(READ_TIMEOUT);
+            conn.setConnectTimeout(connectMs);
+            conn.setReadTimeout(readMs);
             int code = conn.getResponseCode();
             if (code != 200) {
                 LogMgr.d(TAG, "http " + code + " " + hostOf(urlStr));

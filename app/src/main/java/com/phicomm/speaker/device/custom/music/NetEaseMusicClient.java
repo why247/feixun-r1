@@ -44,7 +44,11 @@ public class NetEaseMusicClient {
     private static final String PLAY_URL_PATH = "/member/common-play-url";
 
     // 超时设置（Android 5.1 兼容）
-    private static final int CONNECT_TIMEOUT = 8000;
+    /**
+     * v78: 8000 -> 4000。酷我 search/antiserver 是国内 http, 正常连接 <0.1s; 4s 仍容得下 1s/3s 两次 SYN 重传。
+     * 读超时 15s 不动(慢但活着的服务器照样拿得到)。死主机时 httpGet(2 次) 由 ~16.6s 降到 ~8.6s。
+     */
+    private static final int CONNECT_TIMEOUT = 4000;
     private static final int READ_TIMEOUT = 15000;
 
     // 网络抖动重试：酷我直链偶发失败，单次失败整首歌就播不了，必须重试
@@ -468,6 +472,11 @@ public class NetEaseMusicClient {
     }
 
     /** kuwoResolve 的第 1 段(v76 拆出, 逻辑不变): 无损 酷我车机 FLAC -> GD 台; 关闭/失败返回 null。 */
+    /** v78: 新的一次点歌开始: 无损解析的单首歌内熔断复位。 */
+    public void newResolveRound() {
+        lossless.newRound();
+    }
+
     public String losslessOnly(MusicSearchResult c) {
         if (!losslessEnabled) return null;
         try {
