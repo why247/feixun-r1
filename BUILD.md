@@ -68,7 +68,20 @@ adb logcat -d -v time -s Gadget PhicommChat OpenAIClient MusicClient PhicommMusi
 - `MusicClient: resolved src=kuwo-anti q=mp3(standard)` → 无损没拿到，回落到原来的酷我 MP3
 - `MusicClient: resolved src=qq q=flac/320/128` → QQ 音乐会员直链
 - `PhicommMusicSearch: prefetch prepared in …ms` / `music playing started (prefetched…)` → 播报期间已缓冲, 播报完立即开播
-- `Gadget: ...` → Muse 对话（`first text after …ms` / `reply ready (…) in …ms` 看流式提前返回耗时）
+- `Gadget: ...` → Muse 对话（`first text after …ms` 看 Muse 首字耗时）
+- 按句流式播报（Muse 回答边到边念）：
+  - `Gadget: stream: first sentence ready after …ms (len=N)` → 发问后第一句切出耗时
+  - `Gadget: stream: sentence #k len=N at …ms` → 第 k 句切出
+  - `Gadget: stream end (message_done|text quiet 3000ms|deadline 60000ms): sentences=N chars=M in …ms` → 流结束原因
+  - `Gadget: stream broken after N sentence(s), keep partial` → 中途断线, 已播的不重问, 下轮重连
+  - `PhicommChat: stream turn T begin` / `stream: first sentence ready in …ms (len=N)` / `stream: queued #k len=N`
+  - `PhicommChat: stream: speak first sentence …ms after question` → 「嗯，我想想」之后第一句真正开口
+  - `PhicommChat: stream: speak #k len=N` / `stream: #k TTS end` → 每句开播 / 结束
+  - `PhicommChat: stream: next sentence not here yet (…), wait, no ASR` → 中间句播完下一句未到, 等待(不进 ASR)
+  - `PhicommChat: stream: all N sentence(s) spoken in …ms -> multi-turn/wakeup` → 最后一句结束, 才进多轮 ASR / 唤醒
+  - `PhicommChat: stream turn T cancelled (new question|interrupt …|exit), drop K queued sentence(s)` / `stream: drop stale sentence of turn …` → 打断/新一轮丢弃旧句
+  - `PhicommChat: stream: TTS end of #k not received, advance anyway` → 某句结束事件丢失, 看门狗推进(8s+0.35s/字)
+  - 日志只打序号/长度/耗时, 不打 token 和凭证; 句子原文只写 /sdcard/eav_event.log(`=== 流式 TTS #k ===`)
 
 ## QQ 音乐会员（可选）
 

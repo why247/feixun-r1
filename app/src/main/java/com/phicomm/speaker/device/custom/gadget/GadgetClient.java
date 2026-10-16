@@ -8,8 +8,6 @@ import java.io.OutputStream;
 import java.net.Socket;
 import java.net.URLEncoder;
 import java.nio.charset.StandardCharsets;
-import java.util.ArrayList;
-import java.util.List;
 import javax.net.ssl.SSLSocket;
 import javax.net.ssl.SSLSocketFactory;
 import org.json.JSONArray;
@@ -47,8 +45,10 @@ public final class GadgetClient {
     private static final String WS_KEY = "dGhlIHNhbXBsZSBub25jZQ==";
 
     private static final long REPLY_TIMEOUT_MS = 60_000;
-    /** 流式: 已有文字且 text_append 静默这么久就当本条说完, 立即返回开口(实测文字 0.3 秒内到齐) */
-    private static final long TEXT_QUIET_MS = 250;
+    /** 已有文字且 text_append 静默这么久才算整段说完(不再用 250ms 截断, 长回答可能分多段) */
+    private static final long TEXT_QUIET_MS = 3_000;
+    /** 收到 message_done 后再等这么久, 看是否还有下一段消息; 剩余文字在 message_done 时立即切出 */
+    private static final long MSG_DONE_GRACE_MS = 800;
     /** 发新问题前读掉上一轮提前返回后残留的事件, 读到连续这么久没新帧为止 */
     private static final long PRE_DRAIN_QUIET_MS = 150;
     private static final long KEEPALIVE_MS = 25_000;
@@ -272,8 +272,24 @@ public final class GadgetClient {
      * historyText: recent persona history, may be null (truncated to ~1500 chars).
      * Returns the assistant's reply text (may be empty on failure/timeout).
      */
-    public synchronized String chat(String systemPrompt, String historyText,
-                                    String userInput) throws Exception {
+    public String chat(String systemPrompt, String historyText,
+                       String userInput) throws Exception {
+        return chatStream(systemPrompt, historyText, userInput, null);
+    }
+
+    /** 按句流式回调。在 Gadget 工作线程(持有本对象锁)里调用, 实现要快、不要阻塞。 */
+    public interface SentenceListener {
+        void onSentence(String sentence);
+    }
+
+    /**
+     * 流式版本: 增量文字里遇到句末标点(。！？!?；; 换行…), 或超过约 40 字遇到逗号, 就切出一句交给
+     * listener; message_done 时把剩余文字作为一句切出, 再等 MSG_DONE_GRACE_MS 没有新消息即结束;
+     * 文字静默 TEXT_QUIET_MS 也结束。返回整段文字(兜底/存历史用)。listener 可为 null(=整段接口)。
+     * 方法返回即"流结束"。
+     */
+    public synchronized String chatStream(String systemPrompt, String historyText,
+                                          String userInput, SentenceListener listener) throws Exception {
         if (sock == null || noise == null) {
             connect();   // first turn (PhicommChatHandler only news the client)
         }
@@ -293,14 +309,23 @@ public final class GadgetClient {
                 .put("output_modality", "text");
         if (creds != null) req.put("device_id", creds.nodeId());
         byte[] body = req.toString().getBytes(StandardCharsets.UTF_8);
+        StreamState ss = new StreamState(listener);
         try {
-            // 上一轮是提前返回的(文字静默 250ms / message_done 即返回), 连接上可能还挂着它的
-            // message_done / 状态事件 / 后续消息; 先读掉丢弃, 免得这一轮把上一轮的残余当成回复。
+            // 上一轮结束后连接上可能还挂着它的 message_done / 状态事件 / 后续消息;
+            // 先读掉丢弃, 免得这一轮把上一轮的残余当成回复。
             drainPending();
-            String r = doChat(body);
+            String r = doChat(body, ss);
             if (withPersona) personaSent = true;
             return r;
         } catch (Exception e) {
+            if (ss.emitted > 0) {
+                // 已经播出去的句子不能再重问一遍(会重复播报): 保留已有部分, 断开连接下轮重连
+                log("stream broken after " + ss.emitted + " sentence(s), keep partial: " + e);
+                close();
+                ss.flushRemainder();
+                if (withPersona) personaSent = true;
+                return ss.all.toString().trim();
+            }
             log("chat failed, reconnect once: " + e);
             connect();           // one reconnect attempt (covers IO + protocol errors)
             subBuf.reset();
@@ -311,34 +336,122 @@ public final class GadgetClient {
                 req.put("message", sb2.toString());
                 body = req.toString().getBytes(StandardCharsets.UTF_8);
             }
-            String r = doChat(body);
+            String r = doChat(body, new StreamState(listener));
             personaSent = true;
             return r;
         }
     }
 
-    private String doChat(byte[] body) throws Exception {
+    // ---------------- sentence splitting ----------------
+    /** 句末标点: 遇到就切 */
+    private static final String SENT_END = "。！？!?；;…\n";
+    /** 软切分: 超过这么多字遇到逗号就切 */
+    private static final int SOFT_MAX = 40;
+    /** 硬切分: 一直没有标点, 超过这么多字强制切 */
+    private static final int HARD_MAX = 100;
+    /** 句末标点前的有效字数少于这个就先不切, 和下一句合并(避免「好的！」单独一次 TTS) */
+    private static final int MIN_SENT = 4;
+    /** 跟在句末标点后面、应归到本句的收尾符号 */
+    private static final String CLOSERS = "”’」』）)】\"'。！？!?…";
+
+    /** 一轮流式的状态: 切句缓冲 + 计数 + 回调。 */
+    private static final class StreamState {
+        final SentenceListener listener;
+        final StringBuilder buf = new StringBuilder();   // 还没切出去的文字
+        final StringBuilder all = new StringBuilder();   // 本轮全部文字
+        int emitted = 0;
+        long startedAt = System.currentTimeMillis();
+
+        StreamState(SentenceListener l) { listener = l; }
+
+        void feed(String t) {
+            if (t == null || t.isEmpty()) return;
+            all.append(t);
+            buf.append(t);
+            int i = 0;
+            while (i < buf.length()) {
+                char c = buf.charAt(i);
+                boolean cut = false;
+                if (c == '\n') {
+                    cut = true;
+                } else if (SENT_END.indexOf(c) >= 0) {
+                    cut = contentLen(buf, i) >= MIN_SENT;
+                } else if ((c == '，' || c == ',') && i + 1 >= SOFT_MAX) {
+                    cut = true;
+                } else if (i + 1 >= HARD_MAX) {
+                    cut = true;
+                }
+                if (!cut) { i++; continue; }
+                int end = i + 1;
+                if (c != '\n') {
+                    while (end < buf.length() && CLOSERS.indexOf(buf.charAt(end)) >= 0) end++;
+                }
+                String sent = buf.substring(0, end);
+                buf.delete(0, end);
+                emit(sent);
+                i = 0;
+            }
+        }
+
+        /** 消息结束/流结束: 剩余文字作为一句切出 */
+        void flushRemainder() {
+            if (buf.length() == 0) return;
+            String rest = buf.toString();
+            buf.setLength(0);
+            emit(rest);
+        }
+
+        /** 消息边界: 全文里用换行隔开两段消息 */
+        void messageBoundary() {
+            if (all.length() > 0 && all.charAt(all.length() - 1) != '\n') all.append('\n');
+        }
+
+        private void emit(String s) {
+            String t = s.trim();
+            if (t.isEmpty() || contentLen(t, t.length() - 1) == 0) return;   // 纯标点/空白: 跳过
+            emitted++;
+            long ms = System.currentTimeMillis() - startedAt;
+            if (emitted == 1) log("stream: first sentence ready after " + ms + " ms (len=" + t.length() + ")");
+            else log("stream: sentence #" + emitted + " len=" + t.length() + " at " + ms + " ms");
+            if (listener != null) {
+                try {
+                    listener.onSentence(t);
+                } catch (Throwable e) {
+                    log("stream: listener error: " + e);
+                }
+            }
+        }
+
+        /** buf[0..last] 里字母/数字/汉字的个数 */
+        private static int contentLen(CharSequence b, int last) {
+            int n = 0;
+            for (int k = 0; k <= last && k < b.length(); k++) {
+                if (Character.isLetterOrDigit(b.charAt(k))) n++;
+            }
+            return n;
+        }
+    }
+
+    private String doChat(byte[] body, StreamState ss) throws Exception {
         chatStream = openStream("POST", "/chat/stream",
                 new String[]{"Content-Type", "application/json",
                         "x-request-id", java.util.UUID.randomUUID().toString(),
                         "x-app-id", "musegadget"}, body, true);
         long startedAt = System.currentTimeMillis();
+        ss.startedAt = startedAt;
         long deadline = startedAt + REPLY_TIMEOUT_MS;
-        List<String> messages = new ArrayList<>();
-        StringBuilder cur = new StringBuilder();
+        StringBuilder cur = new StringBuilder();   // 当前这条消息已收到的增量文字
+        boolean sawDelta = false;                  // 本轮收到过 text_append(之后不再采用整条消息文字, 防重复)
         boolean inTurn = false;
         long quietUntil = 0;
+        String endReason = "deadline " + REPLY_TIMEOUT_MS + "ms";
 
         while (true) {
             long now = System.currentTimeMillis();
             // Hard deadline: always exit, never hang (method is synchronized).
             // Return whatever text arrived (may be partial or empty).
             if (now >= deadline) break;
-            if (inTurn && quietUntil > 0 && now >= quietUntil) {
-                log("reply ready (" + (cur.length() > 0 ? "text quiet " + TEXT_QUIET_MS + "ms" : "message_done")
-                        + ") in " + (now - startedAt) + " ms");
-                break;
-            }
+            if (inTurn && quietUntil > 0 && now >= quietUntil) break;
             long wait = Math.min(5_000, deadline - now);
             if (inTurn && quietUntil > 0) wait = Math.min(wait, quietUntil - now);
             sock.setSoTimeout((int) Math.max(100, wait));
@@ -415,12 +528,14 @@ public final class GadgetClient {
                     if ("delta.text_append".equals(name)) {
                         String t = payload.optString("text", "");
                         if (!t.isEmpty()) {
-                            if (cur.length() == 0 && messages.isEmpty())
+                            if (ss.all.length() == 0)
                                 log("first text after " + (System.currentTimeMillis() - startedAt) + " ms");
                             inTurn = true;
+                            sawDelta = true;
                             cur.append(t);
-                            // 流式: 文字静默 250ms 就开口, 不等 message_done / 状态事件
+                            ss.feed(t);   // 按句切出, 回调给播报
                             quietUntil = System.currentTimeMillis() + TEXT_QUIET_MS;
+                            endReason = "text quiet " + TEXT_QUIET_MS + "ms";
                         }
                     } else if ("delta.message_done".equals(name)
                             || "message.assistant".equals(name)) {
@@ -439,13 +554,20 @@ public final class GadgetClient {
                                 txt = payload.optString("content", "");
                             }
                         }
-                        String full = cur.length() > 0 ? cur.toString() : txt;
-                        if (!full.trim().isEmpty()) messages.add(full);
+                        // 没有收到过增量文字(整条消息一次给出)才采用整条文字; 同一条消息的
+                        // delta.message_done 和 message.assistant 可能先后都到, 不能重复播
+                        if (cur.length() == 0 && !sawDelta && !txt.trim().isEmpty()
+                                && ss.all.indexOf(txt.trim()) < 0) {
+                            ss.feed(txt);
+                        }
                         cur.setLength(0);
-                        // 收到 message_done 且已有内容: 立即返回
-                        if (!messages.isEmpty()) {
+                        ss.flushRemainder();     // 本条消息剩余文字作为一句
+                        ss.messageBoundary();
+                        if (ss.all.toString().trim().length() > 0) {
                             inTurn = true;
-                            quietUntil = System.currentTimeMillis();
+                            // 再等一小会看还有没有下一段消息, 没有就结束
+                            quietUntil = System.currentTimeMillis() + MSG_DONE_GRACE_MS;
+                            endReason = "message_done";
                         }
                     }
                 }
@@ -453,15 +575,12 @@ public final class GadgetClient {
             subBuf.reset();
             if (start < buf.length) subBuf.write(buf, start, buf.length - start);
         }
-        // Flush any partial message (e.g. deadline hit mid-turn).
-        if (cur.length() > 0 && cur.toString().trim().length() > 0)
-            messages.add(cur.toString());
-        StringBuilder out = new StringBuilder();
-        for (String m : messages) {
-            if (out.length() > 0) out.append('\n');
-            out.append(m);
-        }
-        return out.toString().trim();
+        // Flush any partial message (e.g. deadline / quiet hit mid-message).
+        ss.flushRemainder();
+        String out = ss.all.toString().trim();
+        log("stream end (" + endReason + "): sentences=" + ss.emitted + " chars=" + out.length()
+                + " in " + (System.currentTimeMillis() - startedAt) + " ms");
+        return out;
     }
 
     // ---------------- warm-up / keep-alive ----------------

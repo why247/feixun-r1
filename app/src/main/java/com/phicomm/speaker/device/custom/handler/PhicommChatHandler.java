@@ -218,6 +218,239 @@ public class PhicommChatHandler extends SimpleUserEventInboundHandler<NLU> {
         return true;
     }
 
+    /** 「嗯，我想想」是否还在播(超过 FILLER_MAX_MS 视为已播完, 兜底丢失的结束事件)。 */
+    private boolean isFillerPlaying() {
+        synchronized (fillerLock) {
+            if (!fillerPlaying) return false;
+            if (System.currentTimeMillis() - fillerStartedAt >= FILLER_MAX_MS) {
+                LogMgr.e(TAG, "filler end event not received in " + FILLER_MAX_MS + "ms, treat as done");
+                fillerPlaying = false;
+                fillerLock.notifyAll();
+                return false;
+            }
+            return true;
+        }
+    }
+
+    // ================= 按句流式播报 (Muse/Gadget) =================
+    // 句子队列: 「嗯，我想想」播完立即播第一句, 每句 TTS 结束事件触发下一句;
+    // 只有最后一句(流已结束且队列空)的结束才走 handleTtsPlayingEnd(多轮 ASR / 唤醒)。
+    // 下一句还没到就等, 绝不进 ASR。streamTurn 是轮次 id: 新一轮/打断时 +1, 旧轮次残余句子全部丢弃。
+    // 锁顺序: streamLock -> fillerLock (反过来不允许)。
+    private final Object streamLock = new Object();
+    private int streamTurn = 0;
+    private boolean streamActive = false;     // 本轮由流式播报接管 TTS 结束事件
+    private boolean streamEnded = false;      // Gadget 流已结束(不会再有新句子)
+    private boolean sentenceSpeaking = false; // 有一句已交给 TTS, 等它的结束事件
+    private int speakSeq = 0;                 // 每 playTTS 一句 +1, 给看门狗配对
+    private int sentencesQueued = 0;
+    private int sentencesSpoken = 0;
+    private long streamStartedAt = 0;
+    private final java.util.LinkedList<String> sentenceQueue = new java.util.LinkedList<String>();
+    private final StringBuilder streamText = new StringBuilder();
+    /** 句子结束事件看门狗: 基础时长 + 每字时长(很宽松, 只防结束事件丢失导致永远卡住) */
+    private static final long SENTENCE_WATCHDOG_BASE_MS = 8000;
+    private static final long SENTENCE_WATCHDOG_PER_CHAR_MS = 350;
+
+    /** 开始新一轮流式播报, 返回轮次 id。 */
+    private int beginStream() {
+        synchronized (streamLock) {
+            streamTurn++;
+            streamActive = true;
+            streamEnded = false;
+            sentenceSpeaking = false;
+            sentencesQueued = 0;
+            sentencesSpoken = 0;
+            sentenceQueue.clear();
+            streamText.setLength(0);
+            streamStartedAt = System.currentTimeMillis();
+            LogMgr.d(TAG, "stream turn " + streamTurn + " begin");
+            return streamTurn;
+        }
+    }
+
+    /** 新一轮唤醒/提问、打断、退出: 作废当前轮次, 清空队列。 */
+    private void cancelStream(String why) {
+        synchronized (streamLock) {
+            if (streamActive || !sentenceQueue.isEmpty()) {
+                LogMgr.d(TAG, "stream turn " + streamTurn + " cancelled (" + why + "), drop "
+                        + sentenceQueue.size() + " queued sentence(s)");
+            }
+            streamTurn++;
+            streamActive = false;
+            streamEnded = false;
+            sentenceSpeaking = false;
+            sentenceQueue.clear();
+        }
+    }
+
+    /** 去掉 markdown 符号等不该念的东西; 没有可念内容返回空串。 */
+    static String cleanForTts(String s) {
+        if (s == null) return "";
+        String t = s.replaceAll("\\[([^\\]]*)\\]\\([^)]*\\)", "$1");   // [文字](链接) -> 文字
+        t = t.replaceAll("(?m)^\\s*[-+*]\\s+", "");                       // 列表符号
+        t = t.replaceAll("[*#`_~>|\\[\\]]", "");                          // * # ` _ ~ > | [ ]
+        t = t.replaceAll("^[”’」』）)】\\s，,。、]+", "");                      // 切句后残留在句首的收尾符号
+        t = t.replaceAll("\\s+", " ").trim();
+        for (int i = 0; i < t.length(); i++) {
+            if (Character.isLetterOrDigit(t.charAt(i))) return t;
+        }
+        return "";
+    }
+
+    /** Gadget 线程回调: 来了一句。 */
+    private void offerSentence(int turn, String raw) {
+        String text = cleanForTts(raw);
+        if (text.isEmpty()) {
+            LogMgr.d(TAG, "stream: skip empty sentence");
+            return;
+        }
+        synchronized (streamLock) {
+            if (turn != streamTurn || !streamActive) {
+                LogMgr.d(TAG, "stream: drop stale sentence of turn " + turn + " (now " + streamTurn + ")");
+                return;
+            }
+            sentencesQueued++;
+            if (sentencesQueued == 1) {
+                LogMgr.d(TAG, "stream: first sentence ready in "
+                        + (System.currentTimeMillis() - streamStartedAt) + "ms (len=" + text.length() + ")");
+            }
+            LogMgr.d(TAG, "stream: queued #" + sentencesQueued + " len=" + text.length());
+            sentenceQueue.add(text);
+            if (streamText.length() > 0) streamText.append(' ');
+            streamText.append(text);
+        }
+        if (advanceStream(turn, "sentence arrived")) runStreamFinalOnMain(turn);
+    }
+
+    /**
+     * Gadget 流结束(chatStream 返回)。返回: -1 本轮已作废(打断/新一轮), 0 没有任何句子(需回落),
+     * >0 句子数(播报由队列接管)。
+     */
+    private int finishStream(int turn) {
+        int n;
+        synchronized (streamLock) {
+            if (turn != streamTurn) return -1;
+            streamEnded = true;
+            n = sentencesQueued;
+            LogMgr.d(TAG, "stream: end, " + n + " sentence(s), "
+                    + (System.currentTimeMillis() - streamStartedAt) + "ms since question");
+            if (n == 0) {
+                streamActive = false;
+                return 0;
+            }
+        }
+        if (advanceStream(turn, "stream end")) runStreamFinalOnMain(turn);
+        return n;
+    }
+
+    /**
+     * 推进队列: 能播就播下一句; 下一句没到就等; 流已结束且队列空且没在播 -> 返回 true,
+     * 调用方负责走 handleTtsPlayingEnd()(多轮 ASR / 唤醒), 这是本轮唯一一次。
+     */
+    private boolean advanceStream(final int turn, String why) {
+        final String next;
+        final int idx;
+        final int seq;
+        final boolean first;
+        synchronized (streamLock) {
+            if (turn != streamTurn || !streamActive) return false;
+            if (sentenceSpeaking) return false;
+            if (isFillerPlaying()) return false;          // 等「嗯，我想想」说完
+            next = sentenceQueue.poll();
+            if (next == null) {
+                if (!streamEnded) {
+                    LogMgr.d(TAG, "stream: next sentence not here yet (" + why + "), wait, no ASR");
+                    return false;
+                }
+                streamActive = false;                     // 本轮结束, 之后的 TTS 结束事件按普通流程
+                LogMgr.d(TAG, "stream: all " + sentencesSpoken + " sentence(s) spoken in "
+                        + (System.currentTimeMillis() - streamStartedAt) + "ms -> multi-turn/wakeup");
+                return true;
+            }
+            sentenceSpeaking = true;
+            idx = ++sentencesSpoken;
+            seq = ++speakSeq;
+            first = (idx == 1);
+        }
+        // 统一切到主线程调 playTTS: 不在 TTS 结束回调里同步重入引擎
+        timeoutHandler.post(new Runnable() {
+            @Override
+            public void run() {
+                synchronized (streamLock) {
+                    if (turn != streamTurn || !streamActive) return;   // 排队期间被打断/新一轮
+                }
+                ANTHandlerContext c = PhicommChatHandler.this.ctx;
+                if (c == null) return;
+                if (first) {
+                    c.stopWakeup();
+                    c.stopASR();
+                    pendingTease = !isIdiomGameMode;
+                    LogMgr.d(TAG, "stream: speak first sentence "
+                            + (System.currentTimeMillis() - streamStartedAt) + "ms after question");
+                }
+                synchronized (streamLock) {
+                    currentResponse = streamText.toString();
+                }
+                LogMgr.d(TAG, "stream: speak #" + idx + " len=" + next.length());
+                writeLog("=== 流式 TTS #" + idx + " === " + next);
+                c.playTTS(next);
+                timeoutHandler.postDelayed(new Runnable() {
+                    @Override
+                    public void run() {
+                        onSentenceWatchdog(turn, seq, idx);
+                    }
+                }, SENTENCE_WATCHDOG_BASE_MS + SENTENCE_WATCHDOG_PER_CHAR_MS * next.length());
+            }
+        });
+        return false;
+    }
+
+    /** 某句的 TTS 结束事件迟迟不来: 当它播完了, 继续(防止永远卡在不进 ASR 的状态)。 */
+    private void onSentenceWatchdog(int turn, int seq, int idx) {
+        synchronized (streamLock) {
+            if (turn != streamTurn || !streamActive || !sentenceSpeaking || seq != speakSeq) return;
+            LogMgr.e(TAG, "stream: TTS end of #" + idx + " not received, advance anyway");
+            sentenceSpeaking = false;
+        }
+        if (advanceStream(turn, "watchdog")) runStreamFinalOnMain(turn);
+    }
+
+    /** 不在 TTS 结束回调里时(流结束/看门狗), 到主线程走一次结束流程。 */
+    private void runStreamFinalOnMain(final int turn) {
+        timeoutHandler.post(new Runnable() {
+            @Override
+            public void run() {
+                synchronized (streamLock) {
+                    if (turn != streamTurn) return;   // 期间已被新一轮/打断作废
+                }
+                handleTtsPlayingEnd();
+            }
+        });
+    }
+
+    /**
+     * TTS 结束事件分流: 不在流式轮次中返回 null(走原流程); 流式中返回 true(已处理,
+     * 中间句子绝不触发 ASR), 若这是最后一句则在这里走 handleTtsPlayingEnd。
+     */
+    private Boolean onStreamTtsEnd() {
+        int turn;
+        synchronized (streamLock) {
+            if (!streamActive) return null;
+            turn = streamTurn;
+            if (!sentenceSpeaking) {
+                LogMgr.d(TAG, "stream: TTS end with no sentence playing, ignored (no ASR)");
+                return Boolean.TRUE;
+            }
+            sentenceSpeaking = false;
+            LogMgr.d(TAG, "stream: #" + sentencesSpoken + " TTS end");
+        }
+        if (advanceStream(turn, "tts end")) {
+            return handleTtsPlayingEnd();
+        }
+        return Boolean.TRUE;
+    }
+
     @Override
     public boolean acceptInboundEvent0(NLU evt) {
         // 只拦截 chat 意图
@@ -304,6 +537,9 @@ public class PhicommChatHandler extends SimpleUserEventInboundHandler<NLU> {
             return;
         }
 
+        // 新一轮提问: 作废上一轮还没播完/还在路上的流式句子
+        cancelStream("new question");
+
         final String userInput = evt.getText();
         this.lastUserInput = userInput;
         LogMgr.d(TAG, "chat intent: " + userInput + ", isIdiomGameMode=" + isIdiomGameMode);
@@ -320,6 +556,7 @@ public class PhicommChatHandler extends SimpleUserEventInboundHandler<NLU> {
                 isProcessingRequest = true;  // ⭐ 标记任务开始
                 try {
                     String response = null;
+                    boolean streamHandled = false;   // 流式已接管播报(或本轮已作废), 不再走整段 playTTS
                     // v87: 豆包链可能随回复带回这条回答的语音(mp3), 有就用豆包自己的声音播
                     byte[] llmAudio = null;
                     String llmAudioFormat = null;
@@ -486,15 +723,37 @@ public class PhicommChatHandler extends SimpleUserEventInboundHandler<NLU> {
 
                             // 调用带 persona systemPrompt + 该 persona 历史
                             if (useGadget && gadgetClient != null) {
-                                // Gadget 直连 Brio: 只回文字, 走原厂 TTS 播放
+                                // Gadget 直连 Brio: 只回文字, 按句流式交给原厂 TTS 播放
+                                final int turn = beginStream();
                                 playFiller(ctx);      // 先说「嗯，我想想」, 让小朋友知道听到了
+                                // 兜底: 「嗯，我想想」的结束事件丢了也要在 6 秒后开始播句子
+                                timeoutHandler.postDelayed(new Runnable() {
+                                    @Override
+                                    public void run() {
+                                        if (advanceStream(turn, "filler backstop")) runStreamFinalOnMain(turn);
+                                    }
+                                }, FILLER_MAX_MS + 50);
                                 try {
-                                    response = gadgetClient.chat(
-                                            activeSysPrompt, historyText, userInput);
+                                    response = gadgetClient.chatStream(
+                                            activeSysPrompt, historyText, userInput,
+                                            new GadgetClient.SentenceListener() {
+                                                @Override
+                                                public void onSentence(String sentence) {
+                                                    offerSentence(turn, sentence);
+                                                }
+                                            });
                                 } catch (Exception ge) {
-                                    LogMgr.e(TAG, "Gadget 直连失败, 回落 OpenAI: " + ge);
+                                    LogMgr.e(TAG, "Gadget 直连失败: " + ge);
                                 }
-                                if (response == null || response.isEmpty()) {
+                                int streamed = finishStream(turn);
+                                if (streamed != 0) {
+                                    // >0: 队列接管播报; -1: 本轮已被打断/新一轮作废, 什么都不播
+                                    streamHandled = true;
+                                    llmAudio = null;
+                                    llmAudioFormat = null;
+                                    if (streamed < 0) LogMgr.d(TAG, "stream turn cancelled, skip playback");
+                                } else if (response == null || response.isEmpty()) {
+                                    LogMgr.e(TAG, "Gadget 无回复, 回落 OpenAI");
                                     // 直连失败/超时: 回落走 OpenAI 池(v91 三级降级)
                                     OpenAIClient.Reply r = openAIClient.chatWithHistoryEx(
                                             userInput, historyText, activeSysPrompt, null);
@@ -531,6 +790,9 @@ public class PhicommChatHandler extends SimpleUserEventInboundHandler<NLU> {
                         LogMgr.d(TAG, "大模型返回: " + response);
                     }
                     
+                    if (streamHandled) {
+                        return;   // 句子队列负责播报和最后一句结束后的多轮 ASR
+                    }
                     // 「嗯，我想想」还没说完就等它说完再开口(不互相打断)
                     waitFillerDone();
                     if (response != null && !response.isEmpty()) {
@@ -605,8 +867,14 @@ public class PhicommChatHandler extends SimpleUserEventInboundHandler<NLU> {
         
         // 「嗯，我想想」的结束事件: 吞掉, 不进多轮 ASR / 调侃流程
         if (consumeFillerEnd()) {
+            int turn;
+            synchronized (streamLock) { turn = streamTurn; }
+            if (advanceStream(turn, "filler end")) return handleTtsPlayingEnd();
             return true;
         }
+        // 流式播报中: 中间句子的结束事件只触发下一句, 绝不进 ASR; 最后一句才走结束流程
+        Boolean streamResult = onStreamTtsEnd();
+        if (streamResult != null) return streamResult.booleanValue();
         // 注意: 使用讯飞 TTS 时,不会触发这个回调
         // 只有使用 ctx.playTTS() 时才会触发
         return handleTtsPlayingEnd();
@@ -724,6 +992,7 @@ public class PhicommChatHandler extends SimpleUserEventInboundHandler<NLU> {
     }
     
     private void exit() {
+        cancelStream("exit");
         try {
             this.ctx.cancelTTS();
             // 注意:不要调用 cancelEngine(),它会取消整个 ANT 引擎导致无法唤醒
@@ -759,6 +1028,8 @@ public class PhicommChatHandler extends SimpleUserEventInboundHandler<NLU> {
     
     @Override
     public void doInterrupt(ANTHandlerContext ctx, String interruptType) {
+        // 打断: 不管 eventReceived, 先作废流式轮次(清空队列, 丢弃之后到达的旧句子)
+        cancelStream("interrupt " + interruptType);
         // 打断处理
         if (eventReceived) {
             LogMgr.d(TAG, "doInterrupt, isIdiomGameMode=" + isIdiomGameMode +
