@@ -68,7 +68,7 @@ public final class UniCarFix {
     }
 
     /** 只读 key 本身这一行(不读其它任何字段)。 */
-    private static String readIni(File f, String key) {
+    static String readIni(File f, String key) {
         if (f == null || !f.isFile()) return null;
         BufferedReader br = null;
         try {

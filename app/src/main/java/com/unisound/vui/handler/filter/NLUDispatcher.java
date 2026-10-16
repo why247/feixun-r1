@@ -581,6 +581,8 @@ public final class NLUDispatcher extends ANTEventDispatcher {
         String trim = localASR.getRecognitionResult().trim();
         
         LogMgr.d("NLUDispatcher", "[DEBUG] Recognized wakeup word: '" + trim + "'");
+        // ⭐ v79: 小孩声音唤醒分低(-11.x), 主唤醒门限放宽到 -12.0(ai_config.ini wakeup_benchmark 可调/off)
+        com.phicomm.speaker.device.custom.engine.WakeupTuning.clamp(ctx.androidContext());
 
         if (a(ctx.androidContext(), trim)) {
             LogMgr.d("NLUDispatcher", trim + " is CompetitionWord, return");
