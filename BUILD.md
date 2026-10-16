@@ -24,10 +24,10 @@ v65 / v67 出过的问题（`PhicommChatHandler.onASREventEngineInitDone` 把 `p
 git fetch
 git checkout night-opt
 git pull
-python build_from_java.py 76
+python build_from_java.py 77
 ```
 
-（`76` 是版本号，随便递增；当前 night-opt = v76。）产物：`build_out\r1_v76.apk`。
+（`77` 是版本号，随便递增；当前 night-opt = v77。）产物：`build_out\r1_v77.apk`。
 
 脚本做的事：
 1. `original_v2/classes.dex` → dex2jar → `tools/base.jar`（原厂类当编译 classpath，去掉 custom/）
@@ -44,14 +44,14 @@ python build_from_java.py 76
 可选让脚本直接装：
 
 ```bat
-python build_from_java.py 76 --install 192.168.10.204:5555
+python build_from_java.py 77 --install 192.168.10.204:5555
 ```
 
 或手动：
 
 ```bat
 adb connect 192.168.10.204:5555
-adb push build_out\r1_v76.apk /sdcard/r1.apk
+adb push build_out\r1_v77.apk /sdcard/r1.apk
 adb shell "CLASSPATH=/system/framework/pm.jar app_process /system/bin com.android.commands.pm.Pm install -r /sdcard/r1.apk"
 adb reboot
 ```
@@ -105,6 +105,12 @@ adb logcat -d -v time -s Gadget PhicommChat OpenAIClient MusicClient PhicommMusi
   - `PhicommMusicSearch: first track: mp3 ready in …ms, lossless pending -> announce early` → 曲目已确定, 先播报; 随后 `timing: lossless ready …ms after intent -> switch buffer to lossless (during TTS|TTS already ended)` 或 `timing: lossless miss|timeout … -> keep mp3`
   - `TTS end, lossless still resolving -> wait (mp3 buffered as fallback)` → 播报完无损还没到, 在等; `first track: lossless ok in …ms (parallel with mp3)` / `lossless miss, mp3 ok` / `mp3 miss, lossless ok` → 并行结果
   - 对比 v74: `timing: resolved …ms after intent -> announce`(应提前) 和 `timing: music playing …ms after intent`(应缩短)
+- v77 新日志关键词(云端 uniCarRet 609):
+  - `NLUDispatcher: unicar609: fix ON (default|ini, …)` → 修复开关状态(设备 files/ai_config.ini 写 `unicar_fix = false` 可恢复原厂行为)
+  - `NLUDispatcher: unicar609: wx_service true|null -> false (engine init done, #1)` → 开机关掉 ASR_OPT_WX_SERVICE(云端 additionalService=wx_adapt, 服务器每句拿 deviceToken 去 POST 已 NXDOMAIN 的 aios-home.hivoice.cn)
+  - `NLUDispatcher: unicar609: clean net_nlu (no uniCarRet) #k` → 生效(前 5 句各一行); onResult 里不应再有 `uniCarRet`, 第一条 partial 也不再是 609 错误串
+  - `NLUDispatcher: unicar609: uniCarRet still in result (turn #k) -> reapply wx_service=false` → 原厂(TTS init done 后 NativeANTEngine.b())又把它置回 true, 已重新关; 若每轮都出现 = 设置没生效, 反馈
+  - 对比: `timing: ASR recording stop` → `net_nlu` 到达(v74 为 173~566ms, 主要是云知声 nluProcessTime 88~392ms, 与 609 无关, 预计变化 ≈0)
 
 ## QQ 音乐会员（可选）
 

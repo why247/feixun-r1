@@ -316,6 +316,8 @@ public class PhicommMusicSearchHandler extends SimpleUserEventInboundHandler<NLU
             LogMgr.e(TAG, "QQMusicClient init failed: " + t);
         }
         tuneVadBackSil();
+        // v77: 关 ASR_OPT_WX_SERVICE(wx_adapt), 云端不再每句去 POST 已死的 aios-home 后端(uniCarRet 609)
+        com.phicomm.speaker.device.custom.engine.UniCarFix.apply(ctx.engine(), ctx.androidContext(), "engine init done");
         prewarmAsync("boot");
         return super.onASREventEngineInitDone(ctx);
     }

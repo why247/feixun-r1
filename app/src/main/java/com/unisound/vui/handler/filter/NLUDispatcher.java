@@ -497,6 +497,8 @@ public final class NLUDispatcher extends ANTEventDispatcher {
     public boolean onASRResultNet(ANTHandlerContext ctx, String result) {
         String str;
         LogMgr.d("NLUDispatcher", "onASRResultNet:" + result);
+        // v77: uniCarRet 609 监测(还在就重新关 wx_service), 只看字符串, 不改结果
+        com.phicomm.speaker.device.custom.engine.UniCarFix.onNetResult(ctx.engine(), ctx.androidContext(), result);
 
         if (earlyGuardActive()) {
             LogMgr.d("NLUDispatcher", "early control: drop late net result of handled turn");
