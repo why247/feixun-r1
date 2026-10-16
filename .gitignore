@@ -30,3 +30,7 @@ build_out/
 # QQ 音乐凭证(含 musickey, 只放音箱 files/, 绝不提交)
 qq_cred.json
 *qq_cred*.json
+
+# 腾讯云语音识别密钥(只放音箱 files/, 绝不提交)
+tencent_asr.json
+*tencent_asr*.json
