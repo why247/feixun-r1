@@ -219,6 +219,11 @@ public final class GadgetProto {
             for (byte[] p : parts) out.write(p, 0, p.length);
             return out.toByteArray();
         }
+
+        /** 还有分片消息没拼完(帧没读完整) */
+        public boolean hasPending() {
+            return !pending.isEmpty();
+        }
     }
 
     /** Decode one decrypted, single-chunk transport payload (legacy entry point). */

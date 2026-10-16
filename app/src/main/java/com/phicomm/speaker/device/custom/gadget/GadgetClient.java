@@ -56,6 +56,13 @@ public final class GadgetClient {
     private static final long MSG_DONE_GRACE_MS = 800;
     /** 发新问题前读掉上一轮提前返回后残留的事件, 读到连续这么久没新帧为止 */
     private static final long PRE_DRAIN_QUIET_MS = 150;
+    /** 上一轮干净结束(message_done+grace 收尾、帧都读完)时, 发问前只做这么短的探测 */
+    private static final long PRE_DRAIN_PROBE_MS = 30;
+    /**
+     * 上一轮是否干净结束: 走完 message_done + MSG_DONE_GRACE_MS、没有拼了一半的分片、订阅缓冲无残行。
+     * 只在 doChat 正常收尾时置 true; 新一轮开始/连接关闭/任何异常路径都保持或置回 false。
+     */
+    private boolean lastTurnClean = false;
     private static final long KEEPALIVE_MS = 25_000;
     /** 保活重连退避上限(原 300s) */
     private static final long MAX_BACKOFF_MS = 60_000;
@@ -636,6 +643,7 @@ public final class GadgetClient {
                 new String[]{"Content-Type", "application/json",
                         "x-request-id", java.util.UUID.randomUUID().toString(),
                         "x-app-id", "musegadget"}, body, true);
+        lastTurnClean = false;
         long startedAt = System.currentTimeMillis();
         ss.startedAt = startedAt;
         long deadline = startedAt + REPLY_TIMEOUT_MS;
@@ -805,8 +813,10 @@ public final class GadgetClient {
         // Flush any partial message (e.g. deadline / quiet hit mid-message).
         if (!"cancelled".equals(endReason)) ss.flushRemainder();
         String out = ss.all.toString().trim();
+        // 干净结束: message_done 后 grace 期满(不是 deadline/文字静默/取消), 且没有残留的半条分片/半行
+        lastTurnClean = "message_done".equals(endReason) && !reasm.hasPending() && subBuf.size() == 0;
         log("stream end (" + endReason + "): sentences=" + ss.emitted + " chars=" + out.length()
-                + " in " + (System.currentTimeMillis() - startedAt) + " ms");
+                + " in " + (System.currentTimeMillis() - startedAt) + " ms" + (lastTurnClean ? " clean" : ""));
         return out;
     }
 
@@ -1008,13 +1018,16 @@ public final class GadgetClient {
     /**
      * 发问前调用(已持有锁): 读掉连接上已到达的残余帧(上一轮提前返回后的 message_done、状态事件等),
      * 解密以保持 Noise nonce 同步, 内容丢弃。连续 150ms 没新帧即结束; 最多 1.5 秒。
+     * 上一轮干净结束时首次只探测 PRE_DRAIN_PROBE_MS(30ms): 探测到任何帧就退回 150ms 静默规则照旧读干净。
      */
     private void drainPending() throws Exception {
         if (sock == null || noise == null) return;
+        final boolean clean = lastTurnClean;
+        lastTurnClean = false;
         long t0 = System.currentTimeMillis();
         int frames = 0;
         try {
-            sock.setSoTimeout((int) PRE_DRAIN_QUIET_MS);
+            sock.setSoTimeout((int) (clean ? PRE_DRAIN_PROBE_MS : PRE_DRAIN_QUIET_MS));
             while (System.currentTimeMillis() - t0 < 1500) {
                 byte[] frame;
                 try {
@@ -1024,12 +1037,15 @@ public final class GadgetClient {
                 }
                 frames++;
                 dispatchIdleFrame(noise.decrypt(frame));
+                // 有残余帧: 不管上一轮是否干净, 之后都按 150ms 静默读完
+                sock.setSoTimeout((int) PRE_DRAIN_QUIET_MS);
             }
         } finally {
             subBuf.reset();
         }
         if (frames > 0) log("pre-chat drain: dropped " + frames + " leftover frames in "
-                + (System.currentTimeMillis() - t0) + " ms");
+                + (System.currentTimeMillis() - t0) + " ms" + (clean ? " (after clean turn)" : ""));
+        else if (clean) log("pre-chat drain: clean probe " + (System.currentTimeMillis() - t0) + " ms");
     }
 
     public synchronized void close() {
@@ -1045,6 +1061,7 @@ public final class GadgetClient {
         }
         sock = null;
         noise = null;
+        lastTurnClean = false;
     }
 
     // ---------------- WebSocket framing ----------------
