@@ -1,5 +1,6 @@
 package com.phicomm.speaker.device.custom.handler;
 
+import java.util.regex.Pattern;
 import android.content.Context;
 import android.os.Handler;
 import android.os.Looper;
@@ -296,14 +297,21 @@ public class PhicommChatHandler extends SimpleUserEventInboundHandler<NLU> {
         }
     }
 
+    // cleanForTts 用的正则: 预编译一次复用
+    private static final Pattern TTS_MD_LINK = Pattern.compile("\\[([^\\]]*)\\]\\([^)]*\\)");
+    private static final Pattern TTS_LIST_MARK = Pattern.compile("(?m)^\\s*[-+*]\\s+");
+    private static final Pattern TTS_MD_SYMBOLS = Pattern.compile("[*#`_~>|\\[\\]]");
+    private static final Pattern TTS_LEAD_CLOSERS = Pattern.compile("^[”’」』）)】\\s，,。、]+");
+    private static final Pattern TTS_SPACES = Pattern.compile("\\s+");
+
     /** 去掉 markdown 符号等不该念的东西; 没有可念内容返回空串。 */
     static String cleanForTts(String s) {
         if (s == null) return "";
-        String t = s.replaceAll("\\[([^\\]]*)\\]\\([^)]*\\)", "$1");   // [文字](链接) -> 文字
-        t = t.replaceAll("(?m)^\\s*[-+*]\\s+", "");                       // 列表符号
-        t = t.replaceAll("[*#`_~>|\\[\\]]", "");                          // * # ` _ ~ > | [ ]
-        t = t.replaceAll("^[”’」』）)】\\s，,。、]+", "");                      // 切句后残留在句首的收尾符号
-        t = t.replaceAll("\\s+", " ").trim();
+        String t = TTS_MD_LINK.matcher(s).replaceAll("$1");   // [文字](链接) -> 文字
+        t = TTS_LIST_MARK.matcher(t).replaceAll("");                       // 列表符号
+        t = TTS_MD_SYMBOLS.matcher(t).replaceAll("");                          // * # ` _ ~ > | [ ]
+        t = TTS_LEAD_CLOSERS.matcher(t).replaceAll("");                      // 切句后残留在句首的收尾符号
+        t = TTS_SPACES.matcher(t).replaceAll(" ").trim();
         for (int i = 0; i < t.length(); i++) {
             if (Character.isLetterOrDigit(t.charAt(i))) return t;
         }

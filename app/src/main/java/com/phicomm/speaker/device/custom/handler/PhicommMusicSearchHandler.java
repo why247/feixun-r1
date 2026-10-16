@@ -1,5 +1,6 @@
 package com.phicomm.speaker.device.custom.handler;
 
+import java.util.regex.Pattern;
 import android.content.Context;
 import android.os.Handler;
 import android.os.Looper;
@@ -821,30 +822,43 @@ public class PhicommMusicSearchHandler extends SimpleUserEventInboundHandler<NLU
 
     // ── 播放控制 ──────────────────────────────────────────────────────
 
+    // controlCommand 用的正则: 预编译一次复用(原来每次调用编译 11 个, 每次交互调用 3 次)
+    private static final Pattern CTL_STRIP_PUNCT = Pattern.compile("[\\s，。！？、,.!?~～…]+");
+    private static final Pattern CTL_STRIP_PREFIX = Pattern.compile("^(请你|请|帮我|麻烦你|麻烦|你)");
+    private static final Pattern CTL_STRIP_SUFFIX = Pattern.compile("(吧|啊|呀|啦|哦|呢|嘛|好吗|好不好|可以吗)+$");
+    private static final Pattern CTL_P_NEXT = Pattern.compile("(下一首|下首|换一首|换首歌|换一首歌|切歌|下一曲|换个歌|换一个歌)(歌)?");
+    private static final Pattern CTL_P_LOOP_OFF = Pattern.compile("(取消|关闭|关掉|不要|别|退出)(单曲)?循环(播放)?|顺序播放|列表循环|列表播放");
+    private static final Pattern CTL_P_LOOP_ON = Pattern.compile("单曲循环(播放)?|循环播放(这首歌?)?|循环这首歌?|这首歌?循环(播放)?|一直(放|播|听)这首歌?");
+    private static final Pattern CTL_P_REPLAY = Pattern.compile("(再|重新)(放|播|听|唱|来)(一遍|一次|一下)?(这首歌?)?|重播|重新播放(这首歌?)?|从头(播放|放|播|开始)");
+    private static final Pattern CTL_P_PAUSE = Pattern.compile("暂停(播放|一下|音乐|一会儿?)?|停(一下|下|下来)?|停止(播放|音乐)?|(别|不要)(放|播|唱)了"
+                + "|不听了|(关掉|关闭)(音乐|歌曲?)|先停(一下)?");
+    private static final Pattern CTL_P_RESUME = Pattern.compile("继续(播放|放|播|唱|听)?(音乐|歌曲?)?|接着(放|播|唱|听)|恢复播放|播放继续|开始播放|播放");
+    private static final Pattern CTL_P_VOL_UP = Pattern.compile("(再|把)?(大声|大点声|开大|调大|声音大|音量大|声音调大|音量调大|声音开大|音量开大|调大音量|调大声音"
+                + "|声音调高|音量调高|调高音量)(一)?(点|些)?(儿)?(声)?|太小声了?");
+    private static final Pattern CTL_P_VOL_DOWN = Pattern.compile("(再|把)?(小声|小点声|关小|调小|声音小|音量小|声音调小|音量调小|声音关小|音量关小|调小音量|调小声音"
+                + "|声音调低|音量调低|调低音量)(一)?(点|些)?(儿)?(声)?|太大声了?|太吵了?");
+
     /**
      * 识别播放控制词(整句匹配, 去掉标点和语气词), 不是控制词返回 CTL_NONE。
      * 「继续播放/暂停播放」里虽然有「播放」, 也不会再被当成点歌。
      */
     static int controlCommand(String text) {
         if (text == null) return CTL_NONE;
-        String t = text.replaceAll("[\\s，。！？、,.!?~～…]+", "");
-        t = t.replaceAll("^(请你|请|帮我|麻烦你|麻烦|你)", "");
-        t = t.replaceAll("(吧|啊|呀|啦|哦|呢|嘛|好吗|好不好|可以吗)+$", "");
+        String t = CTL_STRIP_PUNCT.matcher(text).replaceAll("");
+        t = CTL_STRIP_PREFIX.matcher(t).replaceAll("");
+        t = CTL_STRIP_SUFFIX.matcher(t).replaceAll("");
         if (t.isEmpty() || t.length() > 12) return CTL_NONE;
-        if (t.matches("(下一首|下首|换一首|换首歌|换一首歌|切歌|下一曲|换个歌|换一个歌)(歌)?")) return CTL_NEXT;
-        if (t.matches("(取消|关闭|关掉|不要|别|退出)(单曲)?循环(播放)?|顺序播放|列表循环|列表播放")) return CTL_LOOP_OFF;
-        if (t.matches("单曲循环(播放)?|循环播放(这首歌?)?|循环这首歌?|这首歌?循环(播放)?|一直(放|播|听)这首歌?"))
+        if (CTL_P_NEXT.matcher(t).matches()) return CTL_NEXT;
+        if (CTL_P_LOOP_OFF.matcher(t).matches()) return CTL_LOOP_OFF;
+        if (CTL_P_LOOP_ON.matcher(t).matches())
             return CTL_LOOP_ON;
-        if (t.matches("(再|重新)(放|播|听|唱|来)(一遍|一次|一下)?(这首歌?)?|重播|重新播放(这首歌?)?|从头(播放|放|播|开始)"))
+        if (CTL_P_REPLAY.matcher(t).matches())
             return CTL_REPLAY;
-        if (t.matches("暂停(播放|一下|音乐|一会儿?)?|停(一下|下|下来)?|停止(播放|音乐)?|(别|不要)(放|播|唱)了"
-                + "|不听了|(关掉|关闭)(音乐|歌曲?)|先停(一下)?")) return CTL_PAUSE;
-        if (t.matches("继续(播放|放|播|唱|听)?(音乐|歌曲?)?|接着(放|播|唱|听)|恢复播放|播放继续|开始播放|播放"))
+        if (CTL_P_PAUSE.matcher(t).matches()) return CTL_PAUSE;
+        if (CTL_P_RESUME.matcher(t).matches())
             return CTL_RESUME;
-        if (t.matches("(再|把)?(大声|大点声|开大|调大|声音大|音量大|声音调大|音量调大|声音开大|音量开大|调大音量|调大声音"
-                + "|声音调高|音量调高|调高音量)(一)?(点|些)?(儿)?(声)?|太小声了?")) return CTL_VOL_UP;
-        if (t.matches("(再|把)?(小声|小点声|关小|调小|声音小|音量小|声音调小|音量调小|声音关小|音量关小|调小音量|调小声音"
-                + "|声音调低|音量调低|调低音量)(一)?(点|些)?(儿)?(声)?|太大声了?|太吵了?")) return CTL_VOL_DOWN;
+        if (CTL_P_VOL_UP.matcher(t).matches()) return CTL_VOL_UP;
+        if (CTL_P_VOL_DOWN.matcher(t).matches()) return CTL_VOL_DOWN;
         return CTL_NONE;
     }
 
