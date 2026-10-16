@@ -26,3 +26,7 @@ ai_config.local.ini
 # build_from_java.py
 tools/
 build_out/
+
+# QQ 音乐凭证(含 musickey, 只放音箱 files/, 绝不提交)
+qq_cred.json
+*qq_cred*.json
