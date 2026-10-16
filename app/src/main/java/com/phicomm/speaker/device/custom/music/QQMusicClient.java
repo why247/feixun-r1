@@ -539,8 +539,11 @@ public final class QQMusicClient {
         return r;
     }
 
+    // v73 连接复用: Android 5.1 的 HttpURLConnection(OkHttp)只有把响应体读到 EOF 并 close 流, 连接才回池;
+    // disconnect() 会直接关掉 socket。所以正常/错误响应都读完关闭, 只有异常或响应体超限没读完时才 disconnect。
     private static String httpPost(String urlStr, String body, String cookie) {
         HttpURLConnection conn = null;
+        boolean reusable = false;
         try {
             conn = (HttpURLConnection) new URL(urlStr).openConnection();
             conn.setRequestMethod("POST");
@@ -557,31 +560,87 @@ public final class QQMusicClient {
             int code = conn.getResponseCode();
             if (code != 200) {
                 LogMgr.d(TAG, "qq http " + code);
+                reusable = drainClose(conn.getErrorStream());
                 return null;
             }
-            return readAll(conn.getInputStream());
+            boolean[] eof = new boolean[1];
+            String r = readHttp(conn.getInputStream(), eof);
+            reusable = eof[0];
+            return r;
         } catch (Exception e) {
             LogMgr.d(TAG, "qq http error: " + e.getClass().getSimpleName());
             return null;
         } finally {
-            if (conn != null) conn.disconnect();
+            if (conn != null && !reusable) conn.disconnect();
         }
     }
 
     private static String httpGet(String urlStr) {
         HttpURLConnection conn = null;
+        boolean reusable = false;
         try {
             conn = (HttpURLConnection) new URL(urlStr).openConnection();
             conn.setConnectTimeout(CONNECT_TIMEOUT);
             conn.setReadTimeout(READ_TIMEOUT);
             conn.setRequestProperty("User-Agent", UA);
             conn.setRequestProperty("Referer", "https://y.qq.com/");
-            if (conn.getResponseCode() != 200) return null;
-            return readAll(conn.getInputStream());
+            if (conn.getResponseCode() != 200) {
+                reusable = drainClose(conn.getErrorStream());
+                return null;
+            }
+            boolean[] eof = new boolean[1];
+            String r = readHttp(conn.getInputStream(), eof);
+            reusable = eof[0];
+            return r;
         } catch (Exception e) {
             return null;
         } finally {
-            if (conn != null) conn.disconnect();
+            if (conn != null && !reusable) conn.disconnect();
+        }
+    }
+
+    /** 读 HTTP 响应体(上限 2MB)并关闭流; eof[0]=true 表示读到了 EOF(连接可回池复用)。 */
+    private static String readHttp(InputStream in, boolean[] eof) throws Exception {
+        ByteArrayOutputStream bos = new ByteArrayOutputStream();
+        byte[] buf = new byte[8192];
+        int n;
+        boolean end = false;
+        try {
+            while (true) {
+                n = in.read(buf);
+                if (n < 0) {
+                    end = true;
+                    break;
+                }
+                bos.write(buf, 0, n);
+                if (bos.size() > 2 * 1024 * 1024) break;   // 超限: 不读了, 连接不复用
+            }
+        } finally {
+            in.close();
+        }
+        eof[0] = end;
+        return bos.toString("UTF-8");
+    }
+
+    /** 错误流读到 EOF 并关闭(最多 64KB); 读完返回 true(连接可复用)。没有错误流也算可复用。 */
+    private static boolean drainClose(InputStream es) {
+        if (es == null) return true;
+        byte[] buf = new byte[4096];
+        int total = 0;
+        try {
+            int n;
+            while ((n = es.read(buf)) >= 0) {
+                total += n;
+                if (total > 64 * 1024) return false;
+            }
+            return true;
+        } catch (Exception e) {
+            return false;
+        } finally {
+            try {
+                es.close();
+            } catch (Exception ignored) {
+            }
         }
     }
 
