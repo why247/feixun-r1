@@ -81,6 +81,26 @@ public class PhicommChatHandler extends SimpleUserEventInboundHandler<NLU> {
         "刮风", "下雪", "雾霾", "空气质量", "天气预报", "今天天气", "明天天气"
     };
     
+    // 知识类问法(为什么会下雪/雪是怎么形成的): 含天气词也走大模型, 不当成查天气
+    private static final String[] KNOWLEDGE_WORDS = {
+        "为什么", "为啥", "怎么会", "怎么形成", "怎么来的", "怎么产生", "是什么", "什么是", "原理", "形成"
+    };
+    // 但带明确查询词(今天/明天/会不会/几度...)的仍算查天气
+    private static final String[] WEATHER_QUERY_WORDS = {
+        "今天", "明天", "后天", "现在", "这周", "周末", "会不会", "要不要带伞", "天气预报", "多少度", "几度"
+    };
+
+    static boolean isKnowledgeQuestion(String text) {
+        if (text == null) return false;
+        if (!containsAnyStatic(text, KNOWLEDGE_WORDS)) return false;
+        return !containsAnyStatic(text, WEATHER_QUERY_WORDS);
+    }
+
+    private static boolean containsAnyStatic(String text, String[] words) {
+        for (String w : words) if (text.contains(w)) return true;
+        return false;
+    }
+
     // AI 客户端
     private OpenAIClient openAIClient;
 
@@ -213,8 +233,8 @@ public class PhicommChatHandler extends SimpleUserEventInboundHandler<NLU> {
     private String cancelledSpoken = "";
     private static final String INTERRUPTED_MARK = "（被打断）";
     /** 句子结束事件看门狗: 基础时长 + 每字时长(很宽松, 只防结束事件丢失导致永远卡住) */
-    private static final long SENTENCE_WATCHDOG_BASE_MS = 8000;
-    private static final long SENTENCE_WATCHDOG_PER_CHAR_MS = 350;
+    private static final long SENTENCE_WATCHDOG_BASE_MS = 2500;  // v79: 8000 -> 2500, 原厂 TTS 实测约 0.2s/字
+    private static final long SENTENCE_WATCHDOG_PER_CHAR_MS = 260;  // v79: 350 -> 260
 
     /** 开始新一轮流式播报, 返回轮次 id。 */
     private int beginStream() {
@@ -600,7 +620,7 @@ public class PhicommChatHandler extends SimpleUserEventInboundHandler<NLU> {
             }
             
             // 包含天气关键词 → 放行给 PhicommWeatherHandler(不保存记忆)
-            if (containsAny(text, WEATHER_KEYWORDS)) {
+            if (containsAny(text, WEATHER_KEYWORDS) && !isKnowledgeQuestion(text)) {
                 LogMgr.d(TAG, "包含天气关键词,放行: " + text);
                 return false;
             }
