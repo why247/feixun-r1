@@ -999,10 +999,18 @@ public final class GadgetClient {
 
     /** 不拿锁直接关 socket: 正阻塞在读上的线程立即出异常, 它自己会清理并重连。 */
     private void abortSocket() {
-        Socket s = sock;
-        if (s != null) {
-            try { s.close(); } catch (IOException ignored) { }
-        }
+        final Socket s = sock;
+        if (s == null) return;
+        // v81: 网络广播在主线程回调, SSL socket close 会写 close_notify -> NetworkOnMainThreadException,
+        // 断网时连接根本没关掉。放到后台线程关。
+        Thread t = new Thread(new Runnable() {
+            @Override
+            public void run() {
+                try { s.close(); } catch (Throwable ignored) { }
+            }
+        }, "gadget-abort");
+        t.setDaemon(true);
+        t.start();
     }
 
     private void wsPing() throws IOException {
