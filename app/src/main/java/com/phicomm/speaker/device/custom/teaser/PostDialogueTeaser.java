@@ -57,6 +57,12 @@ public class PostDialogueTeaser {
 
     private static volatile PostDialogueTeaser sInstance;
 
+    /**
+     * 儿童版: 事后调侃整体关闭(调侃提示词是「嘴贱/贴脸开喷」风格, 不适合对孩子说)。
+     * 关闭后 maybeTease 直接返回, 不调用任何大模型、不出声。
+     */
+    public static final boolean ENABLED = false;
+
     /** v86: 调侃任务代号。每次 maybeTease 递增、cancelPending 也递增,
      *  到点执行时代号对不上 = 已被取消/被新一轮取代, 直接放弃。 */
     private static final AtomicInteger sGen = new AtomicInteger(0);
@@ -97,6 +103,10 @@ public class PostDialogueTeaser {
      * 麦克风收走变成自问自答)。中途任何新交互都会经 cancelPending() 作废本任务。
      */
     public void maybeTease(final Context context, final String userText, final long delayMs) {
+        if (!ENABLED) {
+            LogMgr.d(TAG, "[TEASE] disabled (kid-safe build), skip");
+            return;
+        }
         try {
             if (context == null) {
                 return;

@@ -351,9 +351,9 @@ public class AIConfig {
      */
     public void save(Context context) {
         File configFile = new File(context.getFilesDir(), CONFIG_FILE);
+        File tmp = new File(context.getFilesDir(), CONFIG_FILE + ".tmp");
         
         try {
-            FileOutputStream fos = new FileOutputStream(configFile);
             StringBuilder sb = new StringBuilder();
             
             sb.append(SECTION_AI).append("\n");
@@ -366,6 +366,8 @@ public class AIConfig {
             sb.append("thinking = ").append(thinking).append("\n");
             sb.append("tts = ").append(tts == null ? "" : tts).append("\n");
             sb.append("user = ").append(user == null ? "" : user).append("\n");
+            // Muse 直连 token(token 模式才有): 迁移保存时必须保留, 否则下次启动就没了
+            sb.append("gadget_token = ").append(gadgetToken == null ? "" : gadgetToken.trim()).append("\n");
             // 备用端点: 与代码默认值相同时写空, 免得把默认端点固化进文件
             sb.append("fallback_base_url = ")
                     .append(eq(fallbackBaseUrl, DEFAULT_BASE_URL) ? "" : fallbackBaseUrl).append("\n");
@@ -381,8 +383,18 @@ public class AIConfig {
                     .append(eq(fallback2Model, DEFAULT_MODEL) ? "" : fallback2Model).append("\n");
             sb.append("config_version = ").append(configVersion).append("\n");
             
-            fos.write(sb.toString().getBytes("UTF-8"));
-            fos.close();
+            // 原子写: 先写临时文件并 fsync, 再 rename 覆盖, 断电/崩溃不会留下半个配置文件
+            FileOutputStream fos = new FileOutputStream(tmp);
+            try {
+                fos.write(sb.toString().getBytes("UTF-8"));
+                fos.flush();
+                fos.getFD().sync();
+            } finally {
+                fos.close();
+            }
+            if (!tmp.renameTo(configFile)) {
+                throw new java.io.IOException("rename " + tmp.getName() + " -> " + configFile.getName() + " failed");
+            }
             
             LogMgr.d(TAG, "Config saved to: " + configFile.getAbsolutePath());
         } catch (Exception e) {

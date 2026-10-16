@@ -282,6 +282,14 @@ public class PhicommMusicSearchHandler extends SimpleUserEventInboundHandler<NLU
             ctx.playTTS("抱歉，没有听到歌曲名称");
             return;
         }
+        // 儿童安全: 点歌关键词里有不适合小朋友的内容(DJ/喊麦/社会摇/恐怖…)直接婉拒, 不去搜
+        String bad = kidUnsafeWord(keyword, KID_BLOCK_KEYWORD);
+        if (bad != null) {
+            LogMgr.d(TAG, "kid filter: keyword blocked (" + bad + "): " + keyword);
+            currentResult = null;
+            speak(ctx, "这个不太适合小朋友，我们换一首儿歌吧", AFTER_EXIT);
+            return;
+        }
         
         // 异步搜索 + 播放（网络操作不能在主线程）; 500ms 内没解析好就先说「好的」(与搜索并行)
         final int sg = ++searchGen;
@@ -383,7 +391,7 @@ public class PhicommMusicSearchHandler extends SimpleUserEventInboundHandler<NLU
         try {
             // 候选列表(QQ 音乐优先, 否则酷我): 第一首能播的立刻播, 其余进连播队列
             long t0 = System.currentTimeMillis();
-            List<NetEaseMusicClient.MusicSearchResult> cands = musicClient.candidates(keyword);
+            List<NetEaseMusicClient.MusicSearchResult> cands = kidFilter(musicClient.candidates(keyword));
             LogMgr.d(TAG, "timing: search " + cands.size() + " candidates in " + (System.currentTimeMillis() - t0) + "ms");
             int[] picked = new int[]{-1};
             result = resolveFirst(cands, picked, sg);
@@ -404,6 +412,10 @@ public class PhicommMusicSearchHandler extends SimpleUserEventInboundHandler<NLU
             if (result == null) {
                 // 酷我不行再退回 gequbao(单曲, 无队列)
                 result = musicClient.searchAndGetFirst(keyword);
+                if (result != null && kidUnsafeWord(result.name + " " + result.artist, KID_BLOCK_TRACK) != null) {
+                    LogMgr.d(TAG, "kid filter: drop gequbao result " + result.name);
+                    result = null;
+                }
             }
             LogMgr.d(TAG, "queue size after search: " + queue.size());
         } catch (Exception e) {
@@ -812,6 +824,40 @@ public class PhicommMusicSearchHandler extends SimpleUserEventInboundHandler<NLU
                 }
             }
         });
+    }
+
+    // ── 儿童安全过滤 ──
+    /** 点歌关键词含这些词直接婉拒 */
+    static final String[] KID_BLOCK_KEYWORD = {
+            "DJ", "dj", "Dj", "喊麦", "社会摇", "土嗨", "慢摇", "蹦迪", "夜店", "嗨曲", "重低音",
+            "恐怖", "鬼故事", "灵异", "吓人", "血腥", "杀人", "鬼片", "色情", "黄色歌", "脏话", "骂人"
+    };
+    /** 搜索结果(歌名/歌手/专辑)含这些词的版本不放给小朋友 */
+    static final String[] KID_BLOCK_TRACK = {
+            "DJ", "dj", "Dj", "喊麦", "社会摇", "土嗨", "慢摇", "蹦迪", "夜店", "嗨曲", "重低音", "车载",
+            "Remix", "remix", "REMIX", "Explicit", "恐怖", "鬼故事", "灵异", "吓人", "血腥"
+    };
+
+    static String kidUnsafeWord(String s, String[] words) {
+        if (s == null) return null;
+        for (String w : words) if (s.contains(w)) return w;
+        return null;
+    }
+
+    /** 所有搜索结果都过儿童过滤(不只泛指词), 返回新列表。 */
+    static List<NetEaseMusicClient.MusicSearchResult> kidFilter(List<NetEaseMusicClient.MusicSearchResult> in) {
+        List<NetEaseMusicClient.MusicSearchResult> out = new ArrayList<NetEaseMusicClient.MusicSearchResult>();
+        int dropped = 0;
+        for (NetEaseMusicClient.MusicSearchResult r : in) {
+            String all = r.name + " " + r.artist + " " + (r.album == null ? "" : r.album);
+            if (kidUnsafeWord(all, KID_BLOCK_TRACK) != null) {
+                dropped++;
+                continue;
+            }
+            out.add(r);
+        }
+        if (dropped > 0) LogMgr.d(TAG, "kid filter: dropped " + dropped + " of " + in.size() + " candidates");
+        return out;
     }
 
     // ── 首曲播报 ──

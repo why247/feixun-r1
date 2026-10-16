@@ -46,9 +46,26 @@ public class PersonaManager {
     }
     
     /**
+     * 儿童版: 「捣蛋鬼」(捉弄人/emoji) 和「嘴贱欠揍」插嘴人格不对孩子开放。
+     * 激活/恢复/查询到这两个时一律换成默认儿童陪伴人格; 主动插嘴监听不再启动。
+     */
+    public static boolean isKidBlocked(String personaId) {
+        return PersonaConfig.MISCHIEVOUS.equals(personaId) || PersonaConfig.EAVESDROPPER.equals(personaId);
+    }
+
+    private static String kidSafe(String personaId) {
+        if (personaId == null || isKidBlocked(personaId)) return PersonaConfig.DEFAULT;
+        return personaId;
+    }
+
+    /**
      * 激活人格(被动模式)
      */
     public static void activatePersona(String personaId) {
+        if (isKidBlocked(personaId)) {
+            LogMgr.w("PersonaManager", "Persona " + personaId + " blocked in kid-safe build, use default");
+            personaId = PersonaConfig.DEFAULT;
+        }
         PersonaConfig config = PersonaConfig.findByPersonaId(personaId);
         if (config == null) {
             LogMgr.e("PersonaManager", "Persona not found: " + personaId);
@@ -77,6 +94,10 @@ public class PersonaManager {
      * 启动主动监听模式
      */
     public static void startActiveListening(Context context) {
+        if (isKidBlocked(PersonaConfig.EAVESDROPPER)) {
+            LogMgr.d("PersonaManager", "Active listening (eavesdropper) disabled in kid-safe build");
+            return;
+        }
         PersonaConfig activeConfig = PersonaConfig.getActivePersona();
         if (activeConfig == null) {
             LogMgr.e("PersonaManager", "No active persona configured");
@@ -137,6 +158,7 @@ public class PersonaManager {
      * 检查是否应该触发主动监听
      */
     public static boolean shouldTriggerActiveListening(Context context) {
+        if (isKidBlocked(PersonaConfig.EAVESDROPPER)) return false;   // 儿童版不插嘴
         // ⭐ 检查是否在"闭嘴"禁用期内
         if (isShutUpDisabled()) {
             long remainingTime = shutUpEndTime - System.currentTimeMillis();
@@ -220,14 +242,14 @@ public class PersonaManager {
      * 获取当前人格配置
      */
     public static PersonaConfig getCurrentPersonaConfig() {
-        return PersonaConfig.findByPersonaId(currentPersonaId.get());
+        return PersonaConfig.findByPersonaId(kidSafe(currentPersonaId.get()));
     }
     
     /**
      * 获取当前人格ID
      */
     public static String getCurrentPersonaId() {
-        return currentPersonaId.get();
+        return kidSafe(currentPersonaId.get());
     }
     
     /**
@@ -285,6 +307,11 @@ public class PersonaManager {
         
         long shutUpTime = prefs.getLongValue("shut_up_end_time");
         
+        if (isKidBlocked(personaId)) {
+            LogMgr.d("PersonaManager", "Restored persona " + personaId + " blocked in kid-safe build, use default");
+            personaId = PersonaConfig.DEFAULT;
+            modeStr = PersonaMode.PASSIVE.name();
+        }
         currentPersonaId.set(personaId);
         currentMode = PersonaMode.valueOf(modeStr);
         lastInteractionTime = lastTime;

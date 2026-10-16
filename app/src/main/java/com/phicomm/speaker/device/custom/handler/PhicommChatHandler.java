@@ -391,7 +391,7 @@ public class PhicommChatHandler extends SimpleUserEventInboundHandler<NLU> {
                 if (first) {
                     c.stopWakeup();
                     c.stopASR();
-                    pendingTease = !isIdiomGameMode;
+                    pendingTease = false;   // 儿童版: 不做事后调侃
                     LogMgr.d(TAG, "stream: speak first sentence "
                             + (System.currentTimeMillis() - streamStartedAt) + "ms after question");
                 }
@@ -836,9 +836,7 @@ public class PhicommChatHandler extends SimpleUserEventInboundHandler<NLU> {
                         
                         currentResponse = response;
                         // ⭐ v84: 本轮回复来自大模型 → 标记允许事后调侃(playingEnd 时消费)
-                        if (!isIdiomGameMode) {
-                            pendingTease = true;
-                        }
+                        pendingTease = false;   // 儿童版: 事后调侃关闭(PostDialogueTeaser.ENABLED=false)
 
                         // ⭐ v87: 豆包链随回复带回了这条回答的语音 → 用豆包自己的声音播。
                         //    注意 MediaPlayer 播放不会触发引擎的 onTTSEventPlayingEnd,

@@ -32,7 +32,8 @@ public class PersonaRouterHandler extends SimpleUserEventInboundHandler<PersonaA
         PersonaManager.activatePersona(personaId);
         LogMgr.d(TAG, "[DEBUG] PersonaManager.activatePersona called");
         
-        // 2. 获取人格配置
+        // 2. 获取人格配置(儿童版里被屏蔽的人格已换成默认人格, 按实际激活的取, 不播「捣蛋鬼来也」)
+        personaId = PersonaManager.getCurrentPersonaId();
         PersonaConfig config = PersonaConfig.findByPersonaId(personaId);
         if (config == null) {
             LogMgr.e(TAG, "Persona config not found: " + personaId);
