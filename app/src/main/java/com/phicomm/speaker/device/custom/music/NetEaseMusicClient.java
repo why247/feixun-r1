@@ -371,21 +371,70 @@ public class NetEaseMusicClient {
         } catch (Exception e) {
             LogMgr.e(TAG, "kuwo search error: " + e);
         }
-        if (isGeneric(keyword) && !cands.isEmpty()) {
-            List<MusicSearchResult> brand = new ArrayList<MusicSearchResult>();
-            List<MusicSearchResult> other = new ArrayList<MusicSearchResult>();
-            for (MusicSearchResult r : cands) {
-                String all = r.name + " " + r.artist;
-                if (containsAny(all, BAD_WORDS) || r.name.contains("|")) continue;
-                if (containsAny(all, KID_BRANDS)) brand.add(r); else other.add(r);
-            }
-            java.util.Collections.shuffle(brand, random);
-            java.util.Collections.shuffle(other, random);
-            brand.addAll(other);
-            if (!brand.isEmpty()) cands = brand;
-        }
+        cands = genericFilter(keyword, cands);
         LogMgr.d(TAG, "kuwo search '" + keyword + "': " + cands.size() + " candidates");
         return cands;
+    }
+
+    /** 泛指词(儿歌/童谣...): 过滤 DJ/串烧等, 厂牌优先, 再打乱 —— 酷我和 QQ 共用。 */
+    private List<MusicSearchResult> genericFilter(String keyword, List<MusicSearchResult> cands) {
+        if (!isGeneric(keyword) || cands.isEmpty()) return cands;
+        List<MusicSearchResult> brand = new ArrayList<MusicSearchResult>();
+        List<MusicSearchResult> other = new ArrayList<MusicSearchResult>();
+        for (MusicSearchResult r : cands) {
+            String all = r.name + " " + r.artist;
+            if (containsAny(all, BAD_WORDS) || r.name.contains("|")) continue;
+            if (containsAny(all, KID_BRANDS)) brand.add(r); else other.add(r);
+        }
+        java.util.Collections.shuffle(brand, random);
+        java.util.Collections.shuffle(other, random);
+        brand.addAll(other);
+        return brand.isEmpty() ? cands : brand;
+    }
+
+    // ── 统一入口: QQ 音乐(有会员凭证且未被拒) 优先, 否则酷我/GD/gequbao ──────────
+    private final QQMusicClient qq = QQMusicClient.get();
+
+    /** 候选列表: QQ 可用就用 QQ 搜索结果, 搜不到/不可用退回酷我。 */
+    public List<MusicSearchResult> candidates(String keyword) {
+        if (qq.available()) {
+            List<MusicSearchResult> l = qq.search(keyword, isGeneric(keyword) ? 30 : 20);
+            if (!l.isEmpty()) {
+                l = genericFilter(keyword, l);
+                LogMgr.d(TAG, "candidates src=qq '" + keyword + "': " + l.size());
+                return l;
+            }
+            LogMgr.d(TAG, "qq search empty, fallback kuwo");
+        }
+        return kuwoCandidates(keyword);
+    }
+
+    /** 给候选解直链: QQ 候选先走 QQ vkey, 不行再按「歌名 歌手」去酷我链路找同一首。 */
+    public String resolve(MusicSearchResult c) {
+        if (c == null) return null;
+        if ("qq".equals(c.source)) {
+            String u = qq.resolve(c);
+            if (u != null) return u;
+            long t0 = System.currentTimeMillis();
+            String kw = c.name + (c.artist == null || c.artist.isEmpty() ? "" : " " + firstArtistOf(c.artist));
+            List<MusicSearchResult> k = kuwoCandidates(kw);
+            for (int i = 0; i < k.size() && i < 3; i++) {
+                String ku = kuwoResolve(k.get(i));
+                if (ku != null) {
+                    LogMgr.d(TAG, "qq miss -> kuwo chain ok in " + (System.currentTimeMillis() - t0)
+                            + "ms: " + c.name);
+                    return ku;
+                }
+            }
+            LogMgr.d(TAG, "qq miss and kuwo chain miss: " + c.name);
+            return null;
+        }
+        return kuwoResolve(c);
+    }
+
+    private static String firstArtistOf(String artist) {
+        String[] parts = artist.split("[&/、,，;；]");
+        return parts.length == 0 ? artist : parts[0].trim();
     }
 
     /** 给一首候选解出可播直链; 无版权(11 秒提示音)或失败返回 null。 */
@@ -677,7 +726,9 @@ public class NetEaseMusicClient {
      * 搜索结果（不含播放 URL）
      */
     public static class MusicSearchResult {
-        public String id;         // 歌曲 ID（字符串）
+        public String id;         // 歌曲 ID（字符串）; QQ 为 songmid
+        public String source;     // null=酷我/gequbao, "qq"=QQ 音乐
+        public String mediaMid;   // QQ 音乐文件 media_mid
         public String name;       // 歌曲名
         public String artist;     // 歌手
         public String album;      // 专辑
