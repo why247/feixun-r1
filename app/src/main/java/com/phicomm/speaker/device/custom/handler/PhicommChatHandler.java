@@ -121,6 +121,9 @@ public class PhicommChatHandler extends SimpleUserEventInboundHandler<NLU> {
     
     // 上下文
     private ANTHandlerContext ctx;
+    /** v79: 多轮聆听中被吞掉的云知声错误(静默重听) */
+    private volatile boolean silentErrorPending = false;
+    private int silentErrorCount = 0;
     
     // 成语接龙游戏状态
     private boolean isIdiomGameMode = false;  // 是否在成语接龙模式
@@ -576,10 +579,18 @@ public class PhicommChatHandler extends SimpleUserEventInboundHandler<NLU> {
         
         // 注意:这里只处理 chat 意图
         // 如果是 music 或其他 service,需要其他 Handler 处理
+        // ⭐ v79: 多轮「继续聆听」时云知声报错(-91007 联网失败 / 空识别 / nlu 错误): 按小爱习惯静默,
+        //    不播「联网失败」, 重新听一次; 连续 2 次就安静退回唤醒态。
+        if (isMultiTurnMode && !isIdiomGameMode && "cn.yunzhisheng.error".equals(service)) {
+            LogMgr.d(TAG, "multi-turn: swallow error '" + text + "' (silent)");
+            silentErrorPending = true;
+            return true;
+        }
         if (!"cn.yunzhisheng.chat".equals(service)) {
             LogMgr.d(TAG, "service 不是 chat, 放行");
             return false;
         }
+        silentErrorCount = 0;
 
         // ⭐ v86: 用户新交互到达 → 未播的调侃立即作废(调侃绝不跟用户抢话)
         PostDialogueTeaser.get().cancelPending();
@@ -647,6 +658,27 @@ public class PhicommChatHandler extends SimpleUserEventInboundHandler<NLU> {
         if (PostDialogueTeaser.isEchoGuardActive()) {
             LogMgr.d(TAG, "[TEASE] 吞掉调侃回声, 不调大模型: " + evt.getText());
             reset();
+            return;
+        }
+
+        if (silentErrorPending) {
+            silentErrorPending = false;
+            silentErrorCount++;
+            if (silentErrorCount <= 2) {
+                LogMgr.d(TAG, "multi-turn: silent re-listen #" + silentErrorCount);
+                new Handler(Looper.getMainLooper()).postDelayed(new Runnable() {
+                    @Override
+                    public void run() {
+                        if (isMultiTurnMode) ctx.enterASR();
+                    }
+                }, 300);
+            } else {
+                LogMgr.d(TAG, "multi-turn: " + silentErrorCount + " errors in a row -> quiet exit to wakeup");
+                silentErrorCount = 0;
+                isMultiTurnMode = false;
+                if (timeoutRunnable != null) timeoutHandler.removeCallbacks(timeoutRunnable);
+                ctx.enterWakeup(false);
+            }
             return;
         }
 
