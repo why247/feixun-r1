@@ -23,6 +23,7 @@ import nluparser.scheme.NLU;
 import com.phicomm.speaker.device.custom.event.PersonaActivationEvent;
 import com.phicomm.speaker.device.custom.persona.PersonaConfig;
 import com.phicomm.speaker.device.custom.persona.PersonaManager;
+import com.phicomm.speaker.device.custom.handler.PhicommMusicSearchHandler;
 
 import com.unisound.vui.engine.ANTPipeline;
 import nluparser.scheme.Result;
@@ -70,6 +71,93 @@ public final class NLUDispatcher extends ANTEventDispatcher {
         };
         watchdogHandler.postDelayed(recogStallWatchdog, RECOG_STALL_TIMEOUT_MS);
     }
+    // ⭐ v76: 控制词秒响应(小爱风格)。
+    // 实测(r1-128a80da8fee.log 18:19:31): 背景声让 VAD 一直等到 5s 超时, 云端「暂停」4 秒后才到;
+    // 而本地离线语法 1.4s 就给出了 local_asr「暂停」(setting.mp, score -6.21), 原逻辑因 setting.mp 是
+    // 「有网时等云端」的过滤服务把它丢了。现在: 本地结果(分数够高)或云端中间结果整句是控制词, 且
+    // PhicommMusicSearchHandler 自己的播放器会接管(有音乐上下文)时, 立即按原厂离线分发路径 c() 分发
+    // (与无网时本地结果的处理完全相同: fire 1102 + cancelEngine + 发 NLU), 不等 VAD/云端 NLU。
+    // 不调 stopASR(v74 结论: 会挂 8s 看门狗并 cancelEngine 清掉唤醒)。分发后 EARLY_GUARD_MS 内同一轮的
+    // 迟到结果/错误一律吞掉, 录音停止也不挂识别卡死看门狗; 下一轮 ASR(isASR)录音开始即解除。
+    private static final long EARLY_GUARD_MS = 6000;
+    /** 本地语法结果分数门槛: 取原厂 recognizerScore(-12.8) 与 -10 中更严的; 真机控制词 -2.7~-6.2, 误识别 ≤-26 */
+    private static final float EARLY_LOCAL_MIN_SCORE = -10f;
+    private long earlyCtlAt = 0;
+
+    private boolean earlyGuardActive() {
+        return earlyCtlAt > 0 && System.currentTimeMillis() - earlyCtlAt < EARLY_GUARD_MS;
+    }
+
+    private static String stripPunct(String t) {
+        if (t == null) return null;
+        return t.replaceAll("[\\s，。！？、,.!?~～…]+", "");
+    }
+
+    /** 整句是控制词且我们的播放器会接管时立即分发, 返回 true。 */
+    private boolean tryEarlyControl(ANTHandlerContext ctx, String rawText, String src) {
+        if (this.f423a) return false;
+        String text = stripPunct(rawText);
+        if (text == null || text.isEmpty() || text.contains("returnCode")) return false;
+        String svc;
+        try {
+            svc = PhicommMusicSearchHandler.earlyControlService(text);
+        } catch (Throwable t) {
+            LogMgr.e("NLUDispatcher", "early control check failed: " + t);
+            return false;
+        }
+        if (svc == null) return false;
+        long rs = com.phicomm.speaker.device.custom.engine.VoiceTiming.sinceRecordingStart();
+        LogMgr.d("NLUDispatcher", "early control (" + src + ") text=" + text + " -> " + svc
+                + " dispatch now" + (rs >= 0 ? ", +" + rs + "ms since recording start" : ""));
+        NLU n = new NLU();
+        n.setService(svc);
+        n.setCode("SETTING_EXEC");
+        n.setText(text);
+        n.setLocalNLU(true);
+        n.setAsrResult(text);
+        this.f423a = true;
+        this.earlyCtlAt = System.currentTimeMillis();
+        cancelRecogStallWatchdog();
+        c(ctx, n);
+        return true;
+    }
+
+    /** local_asr: 分数够高的本地语法结果(setting.mp / setting / setting.common)。 */
+    private boolean tryEarlyLocal(ANTHandlerContext ctx, String result) {
+        try {
+            LocalASR la = this.c.from(result).getLocalASRList().get(0);
+            float min = Math.max(ANTConfigPreference.recognizerScore, EARLY_LOCAL_MIN_SCORE);
+            if (la.getScore() <= min) return false;
+            NLU n = this.d.from(la.getRecognitionResult());
+            if (n == null || n.getResponseCode() != 0) return false;
+            String svc = n.getService();
+            if (!"cn.yunzhisheng.setting.mp".equals(svc) && !"cn.yunzhisheng.setting".equals(svc)
+                    && !"cn.yunzhisheng.setting.common".equals(svc)) return false;
+            return tryEarlyControl(ctx, n.getText(), "local score=" + la.getScore());
+        } catch (Throwable t) {
+            return false;
+        }
+    }
+
+    /** net_asr partial(中间/局部结果): 文字整句是控制词。 */
+    private boolean tryEarlyNetPartial(ANTHandlerContext ctx, String result) {
+        try {
+            if (result == null || result.indexOf("\"net_asr\"") < 0 || result.indexOf("\"partial\"") < 0) return false;
+            JSONObject root = new JSONObject(result.trim());
+            JSONArray arr = root.optJSONArray("net_asr");
+            if (arr == null || arr.length() == 0) return false;
+            JSONObject a0 = arr.getJSONObject(0);
+            if (!"partial".equals(a0.optString("result_type"))) return false;
+            // 只认本句最后一个 partial(last_result=true): 中途的 partial 可能只是长句开头(「暂停…然后放…」)
+            if (!a0.optBoolean("last_result", false)) return false;
+            String t = a0.optString("recognition_result", "");
+            if (t.isEmpty() || t.contains("returnCode")) return false;
+            return tryEarlyControl(ctx, t, "net partial last=" + a0.optBoolean("last_result"));
+        } catch (Throwable t) {
+            return false;
+        }
+    }
+
     private NluProcessor d;
     private Handler e = new Handler();
     private Runnable f;
@@ -248,11 +336,15 @@ public final class NLUDispatcher extends ANTEventDispatcher {
     /* access modifiers changed from: protected */
     @Override // com.unisound.vui.handler.ANTEventDispatcher
     public boolean onASRError(ANTHandlerContext ctx, String error) {
-        d(ctx);
         LogMgr.i("NLUDispatcher", "-onASRError-" + error);
         JSONObject parseToJSONObject = JsonTool.parseToJSONObject(error);
         String jsonValue = JsonTool.getJsonValue(parseToJSONObject, "errorCode");
         String jsonValue2 = JsonTool.getJsonValue(parseToJSONObject, "errorMsg");
+        if (earlyGuardActive()) {
+            LogMgr.d("NLUDispatcher", "early control: drop late error " + jsonValue + " of handled turn");
+            return true;
+        }
+        d(ctx);
         if (b(jsonValue)) {
             this.b = true;
             return false;
@@ -276,6 +368,9 @@ public final class NLUDispatcher extends ANTEventDispatcher {
     @Override // com.unisound.vui.handler.ANTEventDispatcher
     public boolean onASREventRecordingStart(ANTHandlerContext ctx) {
         LogMgr.i("NLUDispatcher", "onASREventRecordingStart");
+        try {
+            if (earlyCtlAt > 0 && ctx.engine().isASR()) earlyCtlAt = 0;   // 新一轮识别, 解除 v76 早分发保护
+        } catch (Throwable ignored) { }
         a();
         cancelRecogStallWatchdog();
         a(ctx, false);
@@ -285,6 +380,11 @@ public final class NLUDispatcher extends ANTEventDispatcher {
     /* access modifiers changed from: protected */
     @Override // com.unisound.vui.handler.ANTEventDispatcher
     public boolean onASREventRecordingStop(ANTHandlerContext ctx) {
+        if (earlyGuardActive()) {
+            // ⭐ v76: 这一轮已按控制词提前分发, 不再等结果, 不挂看门狗(否则 8s 后 cancelEngine 会清掉唤醒)
+            LogMgr.i("NLUDispatcher", "onASREventRecordingStop after early control -> no watchdog");
+            return super.onASREventRecordingStop(ctx);
+        }
         LogMgr.i("NLUDispatcher", "onASREventRecordingStop -> schedule recog-stall watchdog");
         // ⭐ v82: 录音停止 = 等最终识别结果, 云端死了就会卡死, 挂看门狗兜底
         scheduleRecogStallWatchdog(ctx);
@@ -361,8 +461,15 @@ public final class NLUDispatcher extends ANTEventDispatcher {
     public boolean onASRResultLocal(ANTHandlerContext ctx, String result) {
         LogMgr.d("NLUDispatcher", "onASRResultLocal:" + result);
 
+        if (earlyGuardActive()) {
+            LogMgr.d("NLUDispatcher", "early control: drop late local result of handled turn");
+            return true;
+        }
         if (this.f423a) {
             LogMgr.e("NLUDispatcher", "result has handled, local nlu handle return");
+            return true;
+        }
+        if (tryEarlyLocal(ctx, result)) {
             return true;
         }
 
@@ -384,8 +491,15 @@ public final class NLUDispatcher extends ANTEventDispatcher {
         String str;
         LogMgr.d("NLUDispatcher", "onASRResultNet:" + result);
 
+        if (earlyGuardActive()) {
+            LogMgr.d("NLUDispatcher", "early control: drop late net result of handled turn");
+            return true;
+        }
         if (this.f423a) {
             LogMgr.e("NLUDispatcher", "result has handled, net nlu handle return");
+            return true;
+        }
+        if (tryEarlyNetPartial(ctx, result)) {
             return true;
         }
 

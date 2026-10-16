@@ -69,6 +69,12 @@ public final class VoiceTiming {
                 + since("speech end", speechEndAt, now) + (first ? "" : " (not first)"));
     }
 
+    /** 距本轮 ASR 录音开始的毫秒数, 没有记录返回 -1(v76 控制词早分发日志用) */
+    public static long sinceRecordingStart() {
+        long rs = recStartAt;
+        return rs > 0 ? System.currentTimeMillis() - rs : -1;
+    }
+
     /** handler 拿到 NLU 意图 */
     public static void intent(String who, String text) {
         long now = System.currentTimeMillis();

@@ -146,6 +146,53 @@ public class PhicommMusicSearchHandler extends SimpleUserEventInboundHandler<NLU
         this.sessionName = SessionRegister.SESSION_MUSIC;
         this.musicClient = new NetEaseMusicClient();
         this.mainHandler = new Handler(Looper.getMainLooper());
+        INSTANCE = this;
+    }
+
+    /** v76: NLUDispatcher 控制词早分发要问「这句我们的播放器会不会接管」 */
+    private static volatile PhicommMusicSearchHandler INSTANCE;
+
+    /**
+     * v76 控制词秒响应: text 整句是控制词, 且 acceptInboundEvent0 会由我们的播放器接管时, 返回分发用的
+     * service(与 acceptInboundEvent0 的分支一一对应); 否则 null(NLUDispatcher 照原流程等云端)。
+     * 下一首: 有连播队列; 暂停/继续/重播/循环: 有音乐上下文(在放或 10 分钟内停下); 音量: 有上下文且没被用户暂停。
+     */
+    public static String earlyControlService(String text) {
+        PhicommMusicSearchHandler h = INSTANCE;
+        if (h == null || text == null) return null;
+        int cmd = controlCommand(text);
+        if (cmd == CTL_NONE) return null;
+        if (cmd == CTL_NEXT) {
+            return h.isNextIntent(text) && h.hasQueue() ? "cn.yunzhisheng.setting.mp" : null;
+        }
+        if (cmd >= CTL_PAUSE && cmd <= CTL_LOOP_OFF) {
+            return h.hasMusicContext() ? "cn.yunzhisheng.setting.mp" : null;
+        }
+        if (cmd == CTL_VOL_UP || cmd == CTL_VOL_DOWN) {
+            return h.hasMusicContext() && !h.userPaused ? "cn.yunzhisheng.setting" : null;
+        }
+        return null;
+    }
+
+    /**
+     * v76: 唤醒后识别的 VAD 尾点(说完后静音多久算说完)。原厂 asrVadTimeoutBackSil=800ms, doEnterASR 每次读这个
+     * 静态值, 只能全局改(唤醒后首轮、多轮对话、点歌都一样), 所以只保守地降到 700ms(-100ms/句);
+     * 小孩说话中间停顿 0.7s 以上仍可能被切句。控制词已由本地结果提前分发, 不依赖这个值。
+     */
+    private static final int VAD_BACK_SIL_MS = 700;
+
+    private static void tuneVadBackSil() {
+        try {
+            int old = com.unisound.vui.common.config.ANTConfigPreference.asrVadTimeoutBackSil;
+            if (old > VAD_BACK_SIL_MS) {
+                com.unisound.vui.common.config.ANTConfigPreference.asrVadTimeoutBackSil = VAD_BACK_SIL_MS;
+                LogMgr.d(TAG, "VAD back sil " + old + " -> " + VAD_BACK_SIL_MS + "ms (asr)");
+            } else {
+                LogMgr.d(TAG, "VAD back sil keep " + old + "ms (asr)");
+            }
+        } catch (Throwable t) {
+            LogMgr.e(TAG, "VAD back sil tune failed: " + t);
+        }
     }
     
     @Override
@@ -268,6 +315,7 @@ public class PhicommMusicSearchHandler extends SimpleUserEventInboundHandler<NLU
         } catch (Throwable t) {
             LogMgr.e(TAG, "QQMusicClient init failed: " + t);
         }
+        tuneVadBackSil();
         return super.onASREventEngineInitDone(ctx);
     }
     
@@ -1006,6 +1054,19 @@ public class PhicommMusicSearchHandler extends SimpleUserEventInboundHandler<NLU
         ctx.playTTS(text);
     }
 
+    /** v76: 不说话结束本次交互: 等同「好的」TTS 播完后的 AFTER_EXIT(exit + 回唤醒), 只是没有 TTS。 */
+    private void silentExit(final ANTHandlerContext ctx, final String why) {
+        afterTts = AFTER_NONE;
+        LogMgr.d(TAG, "control " + why + ": silent (no TTS) -> wakeup");
+        mainHandler.post(new Runnable() {
+            @Override
+            public void run() {
+                exit();
+                try { ctx.enterWakeup(false); } catch (Throwable t) { LogMgr.e(TAG, "enterWakeup failed: " + t); }
+            }
+        });
+    }
+
     /** 不说话, 直接回到唤醒监听(音乐继续放, 会话保持, 与「下一首」相同)。 */
     private void backToWakeup(ANTHandlerContext ctx) {
         try { ctx.enterWakeup(false); } catch (Throwable t) { LogMgr.e(TAG, "enterWakeup failed: " + t); }
@@ -1023,7 +1084,7 @@ public class PhicommMusicSearchHandler extends SimpleUserEventInboundHandler<NLU
                 if (isPlaying) stopMusic();
                 userPaused = true;
                 LogMgr.d(TAG, "control pause: stopped, pos=" + (lastPosMs / 1000) + "s, resumable=" + ctxOk);
-                speak(ctx, "好的", AFTER_EXIT);
+                silentExit(ctx, "pause");   // v76: 小爱风格, 暂停/停止不说「好的」、不放提示音
                 return;
             }
             case CTL_RESUME: {
