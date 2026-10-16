@@ -89,9 +89,6 @@ public class PhicommMusicSearchHandler extends SimpleUserEventInboundHandler<NLU
     private static final long QQ_FIRST_BUDGET_MS = 3000;
     /** 有更靠后的候选先成功时, 再等排在前面的(更匹配)这么久 */
     private static final long QQ_PREFER_EARLIER_MS = 300;
-    /** 意图确认后这么久还没解析好就先说「好的」 */
-    private static final long ACK_DELAY_MS = 500;
-    private static final String ACK_TEXT = "好的";
     private static final java.util.concurrent.ExecutorService RESOLVE_POOL =
             java.util.concurrent.Executors.newCachedThreadPool(new java.util.concurrent.ThreadFactory() {
                 @Override
@@ -103,12 +100,8 @@ public class PhicommMusicSearchHandler extends SimpleUserEventInboundHandler<NLU
             });
     /** 每次点歌 +1; 打断时也 +1, 在途的搜索结果作废 */
     private volatile int searchGen = 0;
-    private final Object ackLock = new Object();
-    private static final int ACK_NONE = 0, ACK_PENDING = 1, ACK_SPEAKING = 2, ACK_DONE = 3,
-            ACK_READY_WAIT = 4, ACK_FAIL_WAIT = 5;
-    private int ackState = ACK_NONE;
-    private long intentAt = 0;
-    private boolean firstStartLogged = true;
+    private volatile long intentAt = 0;
+    private volatile boolean firstStartLogged = true;
     /** 下一首预解析: 当前曲开播后后台解析队首并预热 */
     private volatile NetEaseMusicClient.MusicSearchResult preCand;
     private volatile String preUrl;
@@ -292,40 +285,16 @@ public class PhicommMusicSearchHandler extends SimpleUserEventInboundHandler<NLU
             return;
         }
         
-        // 异步搜索 + 播放（网络操作不能在主线程）; 500ms 内没解析好就先说「好的」(与搜索并行)
+        // 异步搜索 + 播放（网络操作不能在主线程）; 解析出直链后播报「为您播放…」, 播报期间缓冲
         final int sg = ++searchGen;
-        synchronized (ackLock) {
-            ackState = ACK_PENDING;
-            intentAt = System.currentTimeMillis();
-            firstStartLogged = false;
-        }
-        mainHandler.postDelayed(new Runnable() {
-            @Override
-            public void run() {
-                speakAckIfPending(ctx, sg);
-            }
-        }, ACK_DELAY_MS);
+        intentAt = System.currentTimeMillis();
+        firstStartLogged = false;
         new Thread(new Runnable() {
             @Override
             public void run() {
                 searchAndPlay(ctx, keyword.trim(), sg);
             }
         }).start();
-    }
-
-    /** 主线程: 搜索还没出结果 -> 先说「好的」。 */
-    private void speakAckIfPending(ANTHandlerContext ctx, int sg) {
-        synchronized (ackLock) {
-            if (sg != searchGen || ackState != ACK_PENDING) return;
-            ackState = ACK_SPEAKING;
-        }
-        LogMgr.d(TAG, "timing: ack \"" + ACK_TEXT + "\" at " + (System.currentTimeMillis() - intentAt)
-                + "ms after intent (search still running)");
-        try {
-            ctx.stopWakeup();
-            ctx.stopASR();
-        } catch (Throwable ignored) { }
-        ctx.playTTS(ACK_TEXT);
     }
     
     /**
@@ -383,8 +352,8 @@ public class PhicommMusicSearchHandler extends SimpleUserEventInboundHandler<NLU
     
     /**
      * 搜索并播放。首曲: 前 3 个 QQ 候选并行取直链(F000 无损优先, 不降级选源), 取第一个可播的,
-     * 总预算约 3 秒; 超时/都不行才进入原有回退链。确认播报只说一次: 500ms 内解析好 -> 「为您播放…」;
-     * 否则已先说「好的」, 解析好后直接开播。
+     * 总预算约 3 秒; 超时/都不行才进入原有回退链。解析好后一律播报「为您播放…」(播报期间预缓冲,
+     * 播完 onTTSEventPlayingEnd 立即开播)。
      */
     private void searchAndPlay(ANTHandlerContext ctx, String keyword, int sg) {
         LogMgr.d(TAG, "searchAndPlay: " + keyword);
@@ -430,49 +399,20 @@ public class PhicommMusicSearchHandler extends SimpleUserEventInboundHandler<NLU
         deliverResult(ctx, result, sg);
     }
 
-    /** 搜索结束: 按「好的」是否已说出决定 播报歌名 / 等「好的」说完 / 直接开播。 */
+    /** 搜索结束: 首曲一律播报「为您播放…」, 播报期间缓冲, TTS 结束(onTTSEventPlayingEnd)立刻开播。 */
     private void deliverResult(ANTHandlerContext ctx, MusicPlayResult result, int sg) {
-        int st;
-        synchronized (ackLock) {
-            if (sg != searchGen) return;
-            st = ackState;
-            if (st == ACK_PENDING) ackState = ACK_NONE;                       // 来得及: 不说「好的」
-            else if (st == ACK_SPEAKING) ackState = result != null ? ACK_READY_WAIT : ACK_FAIL_WAIT;
-            else if (st == ACK_DONE) ackState = ACK_NONE;
-        }
+        if (sg != searchGen) return;
         long sinceIntent = System.currentTimeMillis() - intentAt;
         if (result == null) {
             LogMgr.e(TAG, "search failed (" + sinceIntent + "ms after intent)");
             currentResult = null;
-            if (st == ACK_SPEAKING) return;                 // 「好的」播完再说没找到
             ctx.playTTS("抱歉，未找到相关歌曲");
             return;
         }
         currentResult = result;
         LogMgr.d(TAG, "found: " + result.name + " - " + result.artist + " url=" + result.playUrl);
-        if (st == ACK_SPEAKING) {
-            // 「好的」还在说: 先缓冲, 它说完立即开播(不再报歌名)
-            LogMgr.d(TAG, "timing: resolved " + sinceIntent + "ms after intent, ack still speaking -> prefetch");
-            MusicPrefetcher.prepare(result.playUrl, "music_search");
-            return;
-        }
-        if (st == ACK_DONE) {
-            // 「好的」已说完、在等结果: 直接开播
-            LogMgr.d(TAG, "timing: resolved " + sinceIntent + "ms after intent, ack done -> play now");
-            try {
-                ctx.stopWakeup();
-                ctx.stopASR();
-            } catch (Throwable ignored) { }
-            mainHandler.post(new Runnable() {
-                @Override
-                public void run() {
-                    playMusic(PhicommMusicSearchHandler.this.ctx, new ArrayList<MusicItem>());
-                }
-            });
-            return;
-        }
-        // 500ms 内就解析好了: 只播报歌名(不说「好的」), 播报期间缓冲
         LogMgr.d(TAG, "timing: resolved " + sinceIntent + "ms after intent -> announce");
+        // 停止唤醒和 ASR
         ctx.stopWakeup();
         ctx.stopASR();
         MusicPrefetcher.prepare(result.playUrl, "music_search");
@@ -616,28 +556,6 @@ public class PhicommMusicSearchHandler extends SimpleUserEventInboundHandler<NLU
             return super.onTTSEventPlayingEnd(ctx);
         }
         
-        // 点歌确认「好的」播完
-        int ack;
-        synchronized (ackLock) {
-            ack = ackState;
-            if (ack == ACK_SPEAKING) ackState = ACK_DONE;
-            else if (ack == ACK_READY_WAIT || ack == ACK_FAIL_WAIT) ackState = ACK_NONE;
-        }
-        if (ack == ACK_SPEAKING) {
-            LogMgr.d(TAG, "ack TTS end, still searching (" + (System.currentTimeMillis() - intentAt) + "ms)");
-            return true;   // 搜到后 deliverResult 直接开播
-        }
-        if (ack == ACK_READY_WAIT) {
-            LogMgr.d(TAG, "ack TTS end, result ready -> play");
-            playMusic(ctx, new ArrayList<MusicItem>());
-            return true;
-        }
-        if (ack == ACK_FAIL_WAIT) {
-            currentResult = null;
-            ctx.playTTS("抱歉，未找到相关歌曲");
-            return true;
-        }
-
         // 控制词的简短回复播完
         int after = afterTts;
         if (after != AFTER_NONE) {
@@ -665,9 +583,6 @@ public class PhicommMusicSearchHandler extends SimpleUserEventInboundHandler<NLU
     public void doInterrupt(ANTHandlerContext ctx, String interruptType) {
         if (this.eventReceived) {
             searchGen++;   // 在途的点歌结果作废(不再播报/开播)
-            synchronized (ackLock) {
-                ackState = ACK_NONE;
-            }
             ctx.cancelTTS();
             
             // 停止音乐播放（如果实现了）

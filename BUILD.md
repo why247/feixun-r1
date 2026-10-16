@@ -68,6 +68,9 @@ adb logcat -d -v time -s Gadget PhicommChat OpenAIClient MusicClient PhicommMusi
 - `MusicClient: resolved src=kuwo-anti q=mp3(standard)` → 无损没拿到，回落到原来的酷我 MP3
 - `MusicClient: resolved src=qq q=flac/320/128` → QQ 音乐会员直链
 - `PhicommMusicSearch: prefetch prepared in …ms` / `music playing started (prefetched…)` → 播报期间已缓冲, 播报完立即开播
+- 点歌提速(v71): `PhicommMusicSearch: timing: search N candidates in …ms` → 搜索耗时; `first track: qq parallel #k ok in …ms` / `qq parallel all N miss` / `qq budget 3000ms used up -> fallback chain` / `late qq #k ok` → 首曲 3 候选并行取直链结果
+  - `timing: resolved …ms after intent -> announce` + `announce: 为您播放…` → 首曲解析好后一律播报, 播报期间缓冲; `timing: music playing …ms after intent` → 意图到真正出声
+  - `next prefetch: resolved in …ms, warm-up …ms` / `next: use pre-resolved url` → 下一首预解析(连播/「下一首」不播报)
 - `Gadget: ...` → Muse 对话（`first text after …ms` 看 Muse 首字耗时）
 - 按句流式播报（Muse 回答边到边念）：
   - `Gadget: stream: first sentence ready after …ms (len=N)` → 发问后第一句切出耗时
