@@ -61,12 +61,27 @@ adb reboot
 ## 看日志
 
 ```bat
-adb logcat -d -v time -s Gadget PhicommChat OpenAIClient MusicClient > r1.log
+adb logcat -d -v time -s Gadget PhicommChat OpenAIClient MusicClient PhicommMusicSearch > r1.log
 ```
 
 - `MusicClient: lossless ok src=kuwo-mobi q=flac` / `src=gd-netease q=flac(1411k)` → 正在放无损
 - `MusicClient: resolved src=kuwo-anti q=mp3(standard)` → 无损没拿到，回落到原来的酷我 MP3
-- `Gadget: ...` → Muse 对话
+- `MusicClient: resolved src=qq q=flac/320/128` → QQ 音乐会员直链
+- `PhicommMusicSearch: prefetch prepared in …ms` / `music playing started (prefetched…)` → 播报期间已缓冲, 播报完立即开播
+- `Gadget: ...` → Muse 对话（`first text after …ms` / `reply ready (…) in …ms` 看流式提前返回耗时）
+
+## QQ 音乐会员（可选）
+
+首次扫码登录并把凭证推进音箱（详见 [QQ_LOGIN.md](QQ_LOGIN.md)）：
+
+```bat
+pip install requests qrcode
+python tools\qq_login.py --adb 192.168.10.204:5555 --restart        # 手机 QQ 扫码
+python tools\qq_login.py --wx --adb 192.168.10.204:5555 --restart   # 微信扫码
+```
+
+有凭证时放歌走 QQ 音乐（flac → 320k → 128k），没有/失效自动回到酷我链路。
+日志：`MusicClient: resolved src=qq q=flac in …ms`。
 
 ## 注意
 
