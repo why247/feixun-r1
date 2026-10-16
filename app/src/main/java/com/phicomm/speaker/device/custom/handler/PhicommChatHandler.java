@@ -199,6 +199,19 @@ public class PhicommChatHandler extends SimpleUserEventInboundHandler<NLU> {
     private long streamStartedAt = 0;
     private final java.util.LinkedList<String> sentenceQueue = new java.util.LinkedList<String>();
     private final StringBuilder streamText = new StringBuilder();
+    /**
+     * v78 打断不丢本地历史: 本轮已交给 TTS 的句子(孩子实际听到的), 以及「流已结束、等播完才写历史」的待写记录。
+     * 全部在 streamLock 下读写。本地历史只给 OpenAI 回落用(Gadget/Muse 服务端自己存上下文, 不读它)。
+     */
+    private final StringBuilder spokenText = new StringBuilder();
+    private int histTurn = -1;
+    private ConversationHistory histTarget;
+    private String histUser;
+    private String histFull;
+    /** 最近一次被作废(打断/新一轮/退出)且已开口的轮次, 及当时已说出的文字 */
+    private int cancelledTurn = -1;
+    private String cancelledSpoken = "";
+    private static final String INTERRUPTED_MARK = "（被打断）";
     /** 句子结束事件看门狗: 基础时长 + 每字时长(很宽松, 只防结束事件丢失导致永远卡住) */
     private static final long SENTENCE_WATCHDOG_BASE_MS = 8000;
     private static final long SENTENCE_WATCHDOG_PER_CHAR_MS = 350;
@@ -214,6 +227,7 @@ public class PhicommChatHandler extends SimpleUserEventInboundHandler<NLU> {
             sentencesSpoken = 0;
             sentenceQueue.clear();
             streamText.setLength(0);
+            spokenText.setLength(0);
             streamStartedAt = System.currentTimeMillis();
             LogMgr.d(TAG, "stream turn " + streamTurn + " begin");
             return streamTurn;
@@ -230,11 +244,71 @@ public class PhicommChatHandler extends SimpleUserEventInboundHandler<NLU> {
                 LogMgr.d(TAG, "stream turn " + streamTurn + " cancelled (" + why + "), drop "
                         + sentenceQueue.size() + " queued sentence(s)");
             }
+            if (streamActive) {
+                // v78: 记下被作废这轮孩子已听到的部分; 流已结束在等播完的, 现在按「半截+被打断」写历史
+                cancelledTurn = streamTurn;
+                cancelledSpoken = spokenText.toString();
+                if (histTurn == streamTurn) commitHistoryLocked(cancelledSpoken, true, why);
+            }
             streamTurn++;
             streamActive = false;
             streamEnded = false;
             sentenceSpeaking = false;
             sentenceQueue.clear();
+        }
+    }
+
+    /**
+     * v78: Gadget 流结束后决定怎么写本地历史(原来: chatStream 返回非空就整段写入, 不管孩子听没听完;
+     * 打断前一个字没收到时问题也丢)。streamed: finishStream 的返回值(-1 已作废 / >0 由队列播报)。
+     */
+    private void recordStreamHistory(int turn, int streamed, ConversationHistory h, String userInput, String full) {
+        if (h == null || userInput == null) return;
+        synchronized (streamLock) {
+            if (streamed > 0 && turn == streamTurn && streamActive) {
+                // 还在播: 播完(advanceStream 结束)写整段, 中途被打断写已说出的半截
+                histTurn = turn;
+                histTarget = h;
+                histUser = userInput;
+                histFull = full;
+                return;
+            }
+            histTarget = h;
+            histUser = userInput;
+            histFull = full;
+            histTurn = turn;
+            if (turn == cancelledTurn) {
+                commitHistoryLocked(cancelledSpoken, true, "cancelled before stream end");
+            } else if (streamed > 0) {
+                commitHistoryLocked(full, false, "already spoken");   // finishStream 里已经播完
+            } else {
+                histTurn = -1;
+                histTarget = null;
+            }
+        }
+    }
+
+    /** 持有 streamLock 调用: 写一条历史并清掉待写记录。打断时只写已说出的文字(加标记); 一句没说出就不写。 */
+    private void commitHistoryLocked(String answer, boolean interrupted, String why) {
+        ConversationHistory h = histTarget;
+        String user = histUser;
+        histTurn = -1;
+        histTarget = null;
+        histUser = null;
+        histFull = null;
+        if (h == null || user == null) return;
+        String a = answer == null ? "" : answer.trim();
+        if (a.isEmpty()) {
+            LogMgr.d(TAG, "history: turn " + (interrupted ? "interrupted before any sentence spoken" : "empty") + ", not saved (" + why + ")");
+            return;
+        }
+        if (interrupted) a = a + INTERRUPTED_MARK;
+        try {
+            h.addTurn(user, a);
+            LogMgr.d(TAG, "history: saved " + (interrupted ? "interrupted" : "full") + " turn len=" + a.length()
+                    + " hist_turns=" + h.size() + " (" + why + ")");
+        } catch (Throwable t) {
+            LogMgr.e(TAG, "history: save failed: " + t);
         }
     }
 
@@ -324,11 +398,14 @@ public class PhicommChatHandler extends SimpleUserEventInboundHandler<NLU> {
                     return false;
                 }
                 streamActive = false;                     // 本轮结束, 之后的 TTS 结束事件按普通流程
+                if (histTurn == turn) commitHistoryLocked(histFull, false, "all spoken");
                 LogMgr.d(TAG, "stream: all " + sentencesSpoken + " sentence(s) spoken in "
                         + (System.currentTimeMillis() - streamStartedAt) + "ms -> multi-turn/wakeup");
                 return true;
             }
             sentenceSpeaking = true;
+            if (spokenText.length() > 0) spokenText.append(' ');
+            spokenText.append(next);
             idx = ++sentencesSpoken;
             seq = ++speakSeq;
             first = (idx == 1);
@@ -742,6 +819,7 @@ public class PhicommChatHandler extends SimpleUserEventInboundHandler<NLU> {
                             LogMgr.d(TAG, "Active persona=" + activePersonaId
                                     + " hist_turns=" + personaHistory.size());
 
+                            boolean streamHistoryDone = false;   // v78
                             // 调用带 persona systemPrompt + 该 persona 历史
                             if (useGadget && gadgetClient != null) {
                                 // Gadget 直连 Brio: 只回文字, 按句流式交给原厂 TTS 播放
@@ -765,6 +843,9 @@ public class PhicommChatHandler extends SimpleUserEventInboundHandler<NLU> {
                                 }
                                 int streamed = finishStream(turn);
                                 if (streamed != 0) {
+                                    // v78: 流式轮次的历史由播报进度决定(播完=整段, 打断=已说出的半截+「（被打断）」)
+                                    recordStreamHistory(turn, streamed, personaHistory, userInput, response);
+                                    streamHistoryDone = true;
                                     // >0: 队列接管播报; -1: 本轮已被打断/新一轮作废, 什么都不播
                                     streamHandled = true;
                                     llmAudio = null;
@@ -799,8 +880,8 @@ public class PhicommChatHandler extends SimpleUserEventInboundHandler<NLU> {
                             LogMgr.d(TAG, "随回复带回的语音: "
                                     + (llmAudio == null ? "无(用原厂 TTS)" : llmAudio.length + " 字节"));
 
-                            // 保存到该 persona 的历史
-                            if (response != null && !response.isEmpty()) {
+                            // 保存到该 persona 的历史(流式轮次已由 recordStreamHistory 处理)
+                            if (!streamHistoryDone && response != null && !response.isEmpty()) {
                                 personaHistory.addTurn(userInput, response);
                                 LogMgr.d(TAG, "保存到 persona[" + activePersonaId + "] 历史,轮数: "
                                         + personaHistory.size());
