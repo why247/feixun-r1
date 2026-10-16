@@ -81,6 +81,40 @@ public class PhicommMusicSearchHandler extends SimpleUserEventInboundHandler<NLU
     /** TTS 播完之后做什么(控制词的简短回复用) */
     private static final int AFTER_NONE = 0, AFTER_EXIT = 1, AFTER_RESUME = 2;
     private volatile int afterTts = AFTER_NONE;
+
+    // ── 点歌提速 ──
+    /** 首曲: 前几个 QQ 候选并行取直链 */
+    private static final int QQ_PARALLEL = 3;
+    /** 首曲 QQ 总预算: 超过才进入原有回退链(酷我车机FLAC→GD→酷我MP3→gequbao) */
+    private static final long QQ_FIRST_BUDGET_MS = 3000;
+    /** 有更靠后的候选先成功时, 再等排在前面的(更匹配)这么久 */
+    private static final long QQ_PREFER_EARLIER_MS = 300;
+    /** 意图确认后这么久还没解析好就先说「好的」 */
+    private static final long ACK_DELAY_MS = 500;
+    private static final String ACK_TEXT = "好的";
+    private static final java.util.concurrent.ExecutorService RESOLVE_POOL =
+            java.util.concurrent.Executors.newCachedThreadPool(new java.util.concurrent.ThreadFactory() {
+                @Override
+                public Thread newThread(Runnable r) {
+                    Thread t = new Thread(r, "MusicResolve");
+                    t.setDaemon(true);
+                    return t;
+                }
+            });
+    /** 每次点歌 +1; 打断时也 +1, 在途的搜索结果作废 */
+    private volatile int searchGen = 0;
+    private final Object ackLock = new Object();
+    private static final int ACK_NONE = 0, ACK_PENDING = 1, ACK_SPEAKING = 2, ACK_DONE = 3,
+            ACK_READY_WAIT = 4, ACK_FAIL_WAIT = 5;
+    private int ackState = ACK_NONE;
+    private long intentAt = 0;
+    private boolean firstStartLogged = true;
+    /** 下一首预解析: 当前曲开播后后台解析队首并预热 */
+    private volatile NetEaseMusicClient.MusicSearchResult preCand;
+    private volatile String preUrl;
+    private volatile long preAt;
+    private volatile boolean preRunning = false;
+    private static final long PRE_FRESH_MS = 10 * 60 * 1000L;
     
     public PhicommMusicSearchHandler() {
         this.sessionName = SessionRegister.SESSION_MUSIC;
@@ -249,13 +283,40 @@ public class PhicommMusicSearchHandler extends SimpleUserEventInboundHandler<NLU
             return;
         }
         
-        // 异步搜索 + 播放（网络操作不能在主线程）
+        // 异步搜索 + 播放（网络操作不能在主线程）; 500ms 内没解析好就先说「好的」(与搜索并行)
+        final int sg = ++searchGen;
+        synchronized (ackLock) {
+            ackState = ACK_PENDING;
+            intentAt = System.currentTimeMillis();
+            firstStartLogged = false;
+        }
+        mainHandler.postDelayed(new Runnable() {
+            @Override
+            public void run() {
+                speakAckIfPending(ctx, sg);
+            }
+        }, ACK_DELAY_MS);
         new Thread(new Runnable() {
             @Override
             public void run() {
-                searchAndPlay(ctx, keyword.trim());
+                searchAndPlay(ctx, keyword.trim(), sg);
             }
         }).start();
+    }
+
+    /** 主线程: 搜索还没出结果 -> 先说「好的」。 */
+    private void speakAckIfPending(ANTHandlerContext ctx, int sg) {
+        synchronized (ackLock) {
+            if (sg != searchGen || ackState != ACK_PENDING) return;
+            ackState = ACK_SPEAKING;
+        }
+        LogMgr.d(TAG, "timing: ack \"" + ACK_TEXT + "\" at " + (System.currentTimeMillis() - intentAt)
+                + "ms after intent (search still running)");
+        try {
+            ctx.stopWakeup();
+            ctx.stopASR();
+        } catch (Throwable ignored) { }
+        ctx.playTTS(ACK_TEXT);
     }
     
     /**
@@ -312,25 +373,26 @@ public class PhicommMusicSearchHandler extends SimpleUserEventInboundHandler<NLU
     }
     
     /**
-     * 搜索并播放
+     * 搜索并播放。首曲: 前 3 个 QQ 候选并行取直链(F000 无损优先, 不降级选源), 取第一个可播的,
+     * 总预算约 3 秒; 超时/都不行才进入原有回退链。确认播报只说一次: 500ms 内解析好 -> 「为您播放…」;
+     * 否则已先说「好的」, 解析好后直接开播。
      */
-    private void searchAndPlay(ANTHandlerContext ctx, String keyword) {
+    private void searchAndPlay(ANTHandlerContext ctx, String keyword, int sg) {
         LogMgr.d(TAG, "searchAndPlay: " + keyword);
-        
+        MusicPlayResult result = null;
         try {
             // 候选列表(QQ 音乐优先, 否则酷我): 第一首能播的立刻播, 其余进连播队列
             long t0 = System.currentTimeMillis();
-            MusicPlayResult result = null;
             List<NetEaseMusicClient.MusicSearchResult> cands = musicClient.candidates(keyword);
-            int i = 0;
-            for (; i < cands.size() && i < 12; i++) {
-                String url = musicClient.resolve(cands.get(i));
-                if (url != null) {
-                    result = NetEaseMusicClient.toPlay(cands.get(i), url);
-                    break;
-                }
+            LogMgr.d(TAG, "timing: search " + cands.size() + " candidates in " + (System.currentTimeMillis() - t0) + "ms");
+            int[] picked = new int[]{-1};
+            result = resolveFirst(cands, picked, sg);
+            int i = picked[0];
+            LogMgr.d(TAG, "first track resolved in " + (System.currentTimeMillis() - t0) + "ms, index " + i);
+            if (sg != searchGen) {
+                LogMgr.d(TAG, "search superseded/interrupted, drop result");
+                return;
             }
-            LogMgr.d(TAG, "first track resolved in " + (System.currentTimeMillis() - t0) + "ms, tried " + (i + 1));
             synchronized (queue) {
                 queue.clear();
                 if (result != null) {
@@ -344,29 +406,157 @@ public class PhicommMusicSearchHandler extends SimpleUserEventInboundHandler<NLU
                 result = musicClient.searchAndGetFirst(keyword);
             }
             LogMgr.d(TAG, "queue size after search: " + queue.size());
-            
-            if (result == null) {
-                LogMgr.e(TAG, "search failed");
-                ctx.playTTS("抱歉，未找到相关歌曲");
-                return;
-            }
-            
-            currentResult = result;
-            LogMgr.d(TAG, "found: " + result.name + " - " + result.artist + " url=" + result.playUrl);
-            
-            // 停止唤醒和 ASR
-            ctx.stopWakeup();
-            ctx.stopASR();
-            
-            // 播报期间就开始缓冲, TTS 结束(onTTSEventPlayingEnd)立刻开播; 只有第一首播报
-            MusicPrefetcher.prepare(result.playUrl, "music_search");
-            String ttsText = announceText(result.name, result.artist);
-            LogMgr.d(TAG, "announce: " + ttsText);
-            ctx.playTTS(ttsText);
-            
         } catch (Exception e) {
             LogMgr.e(TAG, "searchAndPlay error: " + e.getMessage(), e);
-            ctx.playTTS("抱歉，播放失败");
+            result = null;
+        }
+        if (sg != searchGen) {
+            LogMgr.d(TAG, "search superseded/interrupted, drop result");
+            return;
+        }
+        deliverResult(ctx, result, sg);
+    }
+
+    /** 搜索结束: 按「好的」是否已说出决定 播报歌名 / 等「好的」说完 / 直接开播。 */
+    private void deliverResult(ANTHandlerContext ctx, MusicPlayResult result, int sg) {
+        int st;
+        synchronized (ackLock) {
+            if (sg != searchGen) return;
+            st = ackState;
+            if (st == ACK_PENDING) ackState = ACK_NONE;                       // 来得及: 不说「好的」
+            else if (st == ACK_SPEAKING) ackState = result != null ? ACK_READY_WAIT : ACK_FAIL_WAIT;
+            else if (st == ACK_DONE) ackState = ACK_NONE;
+        }
+        long sinceIntent = System.currentTimeMillis() - intentAt;
+        if (result == null) {
+            LogMgr.e(TAG, "search failed (" + sinceIntent + "ms after intent)");
+            currentResult = null;
+            if (st == ACK_SPEAKING) return;                 // 「好的」播完再说没找到
+            ctx.playTTS("抱歉，未找到相关歌曲");
+            return;
+        }
+        currentResult = result;
+        LogMgr.d(TAG, "found: " + result.name + " - " + result.artist + " url=" + result.playUrl);
+        if (st == ACK_SPEAKING) {
+            // 「好的」还在说: 先缓冲, 它说完立即开播(不再报歌名)
+            LogMgr.d(TAG, "timing: resolved " + sinceIntent + "ms after intent, ack still speaking -> prefetch");
+            MusicPrefetcher.prepare(result.playUrl, "music_search");
+            return;
+        }
+        if (st == ACK_DONE) {
+            // 「好的」已说完、在等结果: 直接开播
+            LogMgr.d(TAG, "timing: resolved " + sinceIntent + "ms after intent, ack done -> play now");
+            try {
+                ctx.stopWakeup();
+                ctx.stopASR();
+            } catch (Throwable ignored) { }
+            mainHandler.post(new Runnable() {
+                @Override
+                public void run() {
+                    playMusic(PhicommMusicSearchHandler.this.ctx, new ArrayList<MusicItem>());
+                }
+            });
+            return;
+        }
+        // 500ms 内就解析好了: 只播报歌名(不说「好的」), 播报期间缓冲
+        LogMgr.d(TAG, "timing: resolved " + sinceIntent + "ms after intent -> announce");
+        ctx.stopWakeup();
+        ctx.stopASR();
+        MusicPrefetcher.prepare(result.playUrl, "music_search");
+        String ttsText = announceText(result.name, result.artist);
+        LogMgr.d(TAG, "announce: " + ttsText);
+        ctx.playTTS(ttsText);
+    }
+
+    /**
+     * 首曲解析。候选是 QQ: 前 QQ_PARALLEL 个并行问 QQ, 预算 QQ_FIRST_BUDGET_MS 内取第一个可播的
+     * (更靠前的候选再多等 300ms); 不行再进入原有回退链(这几个直接走酷我链路, 不重复问 QQ;
+     * 期间 QQ 迟到的结果仍可用)。非 QQ 候选: 原有串行逻辑不变。picked[0] 返回所选下标。
+     */
+    private MusicPlayResult resolveFirst(final List<NetEaseMusicClient.MusicSearchResult> cands, int[] picked, int sg) {
+        int n = Math.min(cands.size(), 12);
+        if (n == 0) return null;
+        long t0 = System.currentTimeMillis();
+        int par = 0;
+        while (par < Math.min(QQ_PARALLEL, n) && "qq".equals(cands.get(par).source)) par++;
+        List<java.util.concurrent.Future<String>> fs = new ArrayList<java.util.concurrent.Future<String>>();
+        for (int k = 0; k < par; k++) {
+            final NetEaseMusicClient.MusicSearchResult c = cands.get(k);
+            fs.add(RESOLVE_POOL.submit(new java.util.concurrent.Callable<String>() {
+                @Override
+                public String call() {
+                    return QQMusicClient.get().resolve(c);
+                }
+            }));
+        }
+        try {
+            if (par > 0) {
+                long deadline = t0 + QQ_FIRST_BUDGET_MS;
+                long firstOkAt = 0;
+                while (true) {
+                    if (sg != searchGen) return null;
+                    int best = -1;
+                    boolean earlierPending = false;
+                    boolean allDone = true;
+                    for (int k = 0; k < par; k++) {
+                        java.util.concurrent.Future<String> f = fs.get(k);
+                        if (!f.isDone()) {
+                            allDone = false;
+                            if (best < 0) earlierPending = true;
+                            continue;
+                        }
+                        if (best < 0 && futureUrl(f) != null) best = k;
+                    }
+                    long now = System.currentTimeMillis();
+                    if (best >= 0) {
+                        if (firstOkAt == 0) firstOkAt = now;
+                        if (!earlierPending || now - firstOkAt >= QQ_PREFER_EARLIER_MS || now >= deadline) {
+                            picked[0] = best;
+                            LogMgr.d(TAG, "first track: qq parallel #" + best + " ok in " + (now - t0) + "ms");
+                            return NetEaseMusicClient.toPlay(cands.get(best), futureUrl(fs.get(best)));
+                        }
+                    }
+                    if (allDone && best < 0) {
+                        LogMgr.d(TAG, "first track: qq parallel all " + par + " miss in " + (now - t0) + "ms -> fallback chain");
+                        break;
+                    }
+                    if (now >= deadline) {
+                        LogMgr.d(TAG, "first track: qq budget " + QQ_FIRST_BUDGET_MS + "ms used up -> fallback chain");
+                        break;
+                    }
+                    try { Thread.sleep(40); } catch (InterruptedException e) { return null; }
+                }
+            }
+            // 原有回退链(串行): 已并行问过 QQ 的候选直接走酷我链路; 每步前看一眼 QQ 迟到的结果
+            for (int i = 0; i < n; i++) {
+                if (sg != searchGen) return null;
+                for (int k = 0; k < par; k++) {
+                    String late = futureUrl(fs.get(k));
+                    if (late != null) {
+                        picked[0] = k;
+                        LogMgr.d(TAG, "first track: late qq #" + k + " ok in " + (System.currentTimeMillis() - t0) + "ms");
+                        return NetEaseMusicClient.toPlay(cands.get(k), late);
+                    }
+                }
+                NetEaseMusicClient.MusicSearchResult c = cands.get(i);
+                String url = i < par ? musicClient.qqMissKuwoChain(c) : musicClient.resolve(c);
+                if (url != null) {
+                    picked[0] = i;
+                    return NetEaseMusicClient.toPlay(c, url);
+                }
+            }
+            return null;
+        } finally {
+            for (java.util.concurrent.Future<String> f : fs) f.cancel(false);
+        }
+    }
+
+    private static String futureUrl(java.util.concurrent.Future<String> f) {
+        if (!f.isDone() || f.isCancelled()) return null;
+        try {
+            return f.get();
+        } catch (Throwable t) {
+            return null;
         }
     }
     
@@ -413,6 +603,28 @@ public class PhicommMusicSearchHandler extends SimpleUserEventInboundHandler<NLU
             return super.onTTSEventPlayingEnd(ctx);
         }
         
+        // 点歌确认「好的」播完
+        int ack;
+        synchronized (ackLock) {
+            ack = ackState;
+            if (ack == ACK_SPEAKING) ackState = ACK_DONE;
+            else if (ack == ACK_READY_WAIT || ack == ACK_FAIL_WAIT) ackState = ACK_NONE;
+        }
+        if (ack == ACK_SPEAKING) {
+            LogMgr.d(TAG, "ack TTS end, still searching (" + (System.currentTimeMillis() - intentAt) + "ms)");
+            return true;   // 搜到后 deliverResult 直接开播
+        }
+        if (ack == ACK_READY_WAIT) {
+            LogMgr.d(TAG, "ack TTS end, result ready -> play");
+            playMusic(ctx, new ArrayList<MusicItem>());
+            return true;
+        }
+        if (ack == ACK_FAIL_WAIT) {
+            currentResult = null;
+            ctx.playTTS("抱歉，未找到相关歌曲");
+            return true;
+        }
+
         // 控制词的简短回复播完
         int after = afterTts;
         if (after != AFTER_NONE) {
@@ -439,6 +651,10 @@ public class PhicommMusicSearchHandler extends SimpleUserEventInboundHandler<NLU
     @Override
     public void doInterrupt(ANTHandlerContext ctx, String interruptType) {
         if (this.eventReceived) {
+            searchGen++;   // 在途的点歌结果作废(不再播报/开播)
+            synchronized (ackLock) {
+                ackState = ACK_NONE;
+            }
             ctx.cancelTTS();
             
             // 停止音乐播放（如果实现了）
@@ -518,6 +734,16 @@ public class PhicommMusicSearchHandler extends SimpleUserEventInboundHandler<NLU
             if (c == null) return null;
             long t0 = System.currentTimeMillis();
             String url = null;
+            if (c == preCand && preUrl != null && t0 - preAt < PRE_FRESH_MS) {
+                url = preUrl;
+                LogMgr.d(TAG, "next: use pre-resolved url (" + ((t0 - preAt) / 1000) + "s old): " + c.name);
+                long at = preAt;
+                preCand = null;
+                preUrl = null;
+                MusicPlayResult pr = NetEaseMusicClient.toPlay(c, url);
+                pr.resolvedAt = at;
+                return pr;
+            }
             try {
                 url = musicClient.resolve(c);
             } catch (Throwable t) {
@@ -685,6 +911,72 @@ public class PhicommMusicSearchHandler extends SimpleUserEventInboundHandler<NLU
             trackStartedAt = System.currentTimeMillis() - (ok ? seek : 0);
         } else {
             trackStartedAt = System.currentTimeMillis();
+        }
+        if (!firstStartLogged) {
+            firstStartLogged = true;
+            LogMgr.d(TAG, "timing: music playing " + (System.currentTimeMillis() - intentAt) + "ms after intent");
+        }
+        prefetchNext();
+    }
+
+    /** 当前曲开播后: 后台解析队首(下一首)并预热直链, 切歌/连播时直接用。 */
+    private void prefetchNext() {
+        final NetEaseMusicClient.MusicSearchResult c;
+        synchronized (queue) {
+            c = queue.peek();
+        }
+        if (c == null || preRunning) return;
+        if (c == preCand && preUrl != null && System.currentTimeMillis() - preAt < PRE_FRESH_MS) return;
+        preRunning = true;
+        RESOLVE_POOL.submit(new Runnable() {
+            @Override
+            public void run() {
+                try {
+                    long t0 = System.currentTimeMillis();
+                    String u = musicClient.resolve(c);
+                    long t1 = System.currentTimeMillis();
+                    if (u == null) {
+                        LogMgr.d(TAG, "next prefetch: resolve miss in " + (t1 - t0) + "ms: " + c.name);
+                        return;
+                    }
+                    preCand = c;
+                    preUrl = u;
+                    preAt = t1;
+                    long warm = warmUp(u);
+                    LogMgr.d(TAG, "next prefetch: resolved in " + (t1 - t0) + "ms, warm-up "
+                            + (warm >= 0 ? warm + "ms" : "failed") + ": " + c.name);
+                } catch (Throwable t) {
+                    LogMgr.e(TAG, "next prefetch error: " + t);
+                } finally {
+                    preRunning = false;
+                }
+            }
+        });
+    }
+
+    /**
+     * 预热: 只取直链开头 64KB(DNS/TCP/CDN 回源提前做掉)。原厂只有一个 MediaPlayer, 正在放当前曲,
+     * 没法真正把下一首缓冲进播放器。返回耗时, 失败 -1。
+     */
+    private static long warmUp(String u) {
+        long t0 = System.currentTimeMillis();
+        java.net.HttpURLConnection conn = null;
+        try {
+            conn = (java.net.HttpURLConnection) new java.net.URL(u).openConnection();
+            conn.setConnectTimeout(5000);
+            conn.setReadTimeout(5000);
+            conn.setRequestProperty("Range", "bytes=0-65535");
+            conn.setRequestProperty("User-Agent", "Mozilla/5.0 (Linux; U; Android 5.1.1; Phicomm R1)");
+            java.io.InputStream in = conn.getInputStream();
+            byte[] b = new byte[8192];
+            int total = 0, r;
+            while (total < 65536 && (r = in.read(b)) > 0) total += r;
+            in.close();
+            return System.currentTimeMillis() - t0;
+        } catch (Throwable t) {
+            return -1;
+        } finally {
+            if (conn != null) conn.disconnect();
         }
     }
 

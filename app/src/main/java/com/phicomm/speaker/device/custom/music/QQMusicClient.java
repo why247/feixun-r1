@@ -209,17 +209,19 @@ public final class QQMusicClient {
         }
     }
 
-    /** 用前检查: 凭证超过 20 小时就先同步续期一次(失败继续用旧值)。 */
-    private void refreshIfStale() {
+    /**
+     * 用前检查: 凭证超过 20 小时就在后台续期一次(点歌路径绝不同步续期, 这次照常用旧 key)。
+     */
+    private void refreshIfStaleAsync() {
         JSONObject c = cred;
         if (c == null) return;
         if (ageMs(c) < STALE_BEFORE_USE_MS) return;
-        if (System.currentTimeMillis() - lastAttempt < MIN_ATTEMPT_GAP_MS) return;
-        refresh("stale");
+        refreshAsync("stale");
     }
 
     private void refreshAsync(final String why) {
         if (System.currentTimeMillis() - lastAttempt < MIN_ATTEMPT_GAP_MS) return;
+        if (refreshing.get()) return;
         new Thread(new Runnable() {
             @Override
             public void run() {
@@ -228,10 +230,33 @@ public final class QQMusicClient {
         }, "QQMusicRefreshNow").start();
     }
 
-    /** music.login.LoginServer.Login loginMode=2 刷新 musickey, 成功原子写回 qq_cred.json。 */
-    public synchronized boolean refresh(String why) {
-        lastAttempt = System.currentTimeMillis();
-        JSONObject c = cred;
+    /** 正在续期(同一时刻只跑一个) */
+    private final java.util.concurrent.atomic.AtomicBoolean refreshing =
+            new java.util.concurrent.atomic.AtomicBoolean(false);
+
+    /**
+     * music.login.LoginServer.Login loginMode=2 刷新 musickey, 成功原子写回 qq_cred.json。
+     * 网络请求不持有对象锁(不挡 available()/search()/resolve()), 只在换上新凭证时短暂加锁。
+     * 只由后台线程调用(每日续期线程 / refreshAsync)。
+     */
+    public boolean refresh(String why) {
+        if (!refreshing.compareAndSet(false, true)) {
+            LogMgr.d(TAG, "qq refresh skipped (" + why + "): already running");
+            return false;
+        }
+        try {
+            return refreshInner(why);
+        } finally {
+            refreshing.set(false);
+        }
+    }
+
+    private boolean refreshInner(String why) {
+        JSONObject c;
+        synchronized (this) {
+            lastAttempt = System.currentTimeMillis();
+            c = cred;
+        }
         if (c == null) return false;
         if (c.optString("refresh_key", "").isEmpty()) {
             LogMgr.d(TAG, "qq refresh skipped (" + why + "): no refresh_key, rescan when expired");
@@ -285,9 +310,11 @@ public final class QQMusicClient {
                 n.put(k, v);
             }
             n.put("saved_at", System.currentTimeMillis());
-            save(n);
-            cred = n;
-            rejected = false;
+            synchronized (this) {
+                save(n);
+                cred = n;
+                rejected = false;
+            }
             LogMgr.d(TAG, "qq refresh ok (" + why + ") in " + (System.currentTimeMillis() - t0)
                     + "ms, key_len=" + n.optString("musickey").length());
             return true;
@@ -401,7 +428,7 @@ public final class QQMusicClient {
         synchronized (this) {
             reloadIfChanged();
             if (cred == null || rejected) return null;
-            refreshIfStale();
+            refreshIfStaleAsync();
             cr = cred;
         }
         long t0 = System.currentTimeMillis();

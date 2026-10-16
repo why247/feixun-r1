@@ -415,6 +415,17 @@ public class NetEaseMusicClient {
         if ("qq".equals(c.source)) {
             String u = qq.resolve(c);
             if (u != null) return u;
+            return qqMissKuwoChain(c);
+        }
+        return kuwoResolve(c);
+    }
+
+    /**
+     * QQ 候选拿不到 QQ 直链时的原有回退: 按「歌名 歌手」去酷我链路(车机FLAC→GD→酷我MP3)找同一首。
+     * (从 resolve 拆出来, 逻辑不变; 首曲并行试过 QQ 后直接走这里, 不再重复问一次 QQ。)
+     */
+    public String qqMissKuwoChain(MusicSearchResult c) {
+        {
             long t0 = System.currentTimeMillis();
             String kw = c.name + (c.artist == null || c.artist.isEmpty() ? "" : " " + firstArtistOf(c.artist));
             List<MusicSearchResult> k = kuwoCandidates(kw);
@@ -429,7 +440,6 @@ public class NetEaseMusicClient {
             LogMgr.d(TAG, "qq miss and kuwo chain miss: " + c.name);
             return null;
         }
-        return kuwoResolve(c);
     }
 
     private static String firstArtistOf(String artist) {
