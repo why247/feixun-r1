@@ -602,7 +602,41 @@ public class PhicommMusicSearchHandler extends SimpleUserEventInboundHandler<NLU
                     }
                     continue;
                 }
-                String url = i < par ? musicClient.qqMissKuwoChain(c) : musicClient.resolve(c);
+                String url;
+                if (par > 0) {
+                    // v78: 回退链这一步放后台跑, 等它的同时盯着前面并行问的 QQ: QQ 迟到的结果一到就用 QQ
+                    // (更靠前的候选 + QQ F000 无损), 不再等酷我/GD 整条链跑完(原来要等这一步结束才看一眼, 可达 5~30s)
+                    final NetEaseMusicClient.MusicSearchResult fc = c;
+                    final boolean chainOnly = i < par;
+                    java.util.concurrent.Future<String> step = RESOLVE_POOL.submit(new java.util.concurrent.Callable<String>() {
+                        @Override
+                        public String call() {
+                            return chainOnly ? musicClient.qqMissKuwoChain(fc) : musicClient.resolve(fc);
+                        }
+                    });
+                    try {
+                        while (true) {
+                            if (sg != searchGen) return null;
+                            boolean stepDone = step.isDone();   // 先取状态再看 QQ: 同时到时 QQ 优先
+                            for (int k = 0; k < par; k++) {
+                                String late = futureUrl(fs.get(k));
+                                if (late != null) {
+                                    picked[0] = k;
+                                    LogMgr.d(TAG, "first track: late qq #" + k + " ok in " + (System.currentTimeMillis() - t0)
+                                            + "ms (during fallback step #" + i + ") -> use qq");
+                                    return NetEaseMusicClient.toPlay(cands.get(k), late);
+                                }
+                            }
+                            if (stepDone) break;
+                            try { Thread.sleep(40); } catch (InterruptedException e) { return null; }
+                        }
+                    } finally {
+                        if (!step.isDone()) step.cancel(true);   // 酷我链在下一个候选前停下(不再多耗 GD 额度)
+                    }
+                    url = futureUrl(step);
+                } else {
+                    url = musicClient.resolve(c);
+                }
                 if (url != null) {
                     picked[0] = i;
                     return NetEaseMusicClient.toPlay(c, url);
@@ -621,6 +655,16 @@ public class PhicommMusicSearchHandler extends SimpleUserEventInboundHandler<NLU
                 @Override
                 public void run() {
                     long t0 = System.currentTimeMillis();
+                    if ("intent".equals(why)) {
+                        // v78: QQ 会员可用时点歌走 QQ, 不在 QQ 搜索/取直链的同时做酷我/车机 DNS(不和 QQ 抢任何资源);
+                        // QQ 落空才进酷我链路, 那时冷 DNS 只多几十 ms。开机预热不变。
+                        boolean qqOn = false;
+                        try { qqOn = QQMusicClient.get().available(); } catch (Throwable ignored) { }
+                        if (qqOn) {
+                            LogMgr.d(TAG, "timing: prewarm (intent) skipped, qq on");
+                            return;
+                        }
+                    }
                     try {
                         musicClient.prewarm();
                     } catch (Throwable t) {

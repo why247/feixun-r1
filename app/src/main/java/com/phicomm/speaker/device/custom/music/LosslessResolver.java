@@ -104,6 +104,11 @@ public class LosslessResolver {
             long tm = System.currentTimeMillis();
             mobiNetFail = false;
             url = kuwoMobiFlac(kuwoRid);
+            if (url == null && Thread.currentThread().isInterrupted()) {
+                // v78: 调用方已放弃这一步(迟到的 QQ 被选用): 不算失败(不熔断/不计 30 分钟退避), 也不再去 GD 耗额度
+                LogMgr.d(TAG, "lossless abandoned (caller cancelled): " + name);
+                return null;
+            }
             if (mobiNetFail) {
                 mobiTripRound = round;
                 mobiTripAt = System.currentTimeMillis();
@@ -122,6 +127,10 @@ public class LosslessResolver {
         }
 
         // 2. GD 音乐台(网易云源)
+        if (url == null && Thread.currentThread().isInterrupted()) {
+            LogMgr.d(TAG, "lossless abandoned before gd (caller cancelled): " + name);
+            return null;
+        }
         if (url == null && name != null && !name.isEmpty()) {
             String[] r = gdNetease(name, artist);
             if (r != null) {

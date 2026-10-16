@@ -446,6 +446,10 @@ public class NetEaseMusicClient {
             String kw = c.name + (c.artist == null || c.artist.isEmpty() ? "" : " " + firstArtistOf(c.artist));
             List<MusicSearchResult> k = kuwoCandidates(kw);
             for (int i = 0; i < k.size() && i < 3; i++) {
+                if (Thread.currentThread().isInterrupted()) {   // v78: 迟到的 QQ 已被选用, 别再往下试
+                    LogMgr.d(TAG, "qq miss -> kuwo chain abandoned (qq arrived late): " + c.name);
+                    return null;
+                }
                 String ku = kuwoResolve(k.get(i));
                 if (ku != null) {
                     LogMgr.d(TAG, "qq miss -> kuwo chain ok in " + (System.currentTimeMillis() - t0)
