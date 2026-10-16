@@ -89,6 +89,10 @@ adb logcat -d -v time -s Gadget PhicommChat OpenAIClient MusicClient PhicommMusi
   - `Gadget: pre-chat drain: clean probe …ms` → 上一轮干净结束, 发问前只探测 30ms; `… dropped N leftover frames in …ms (after clean turn)` → 干净结束后仍有残余帧(已退回 150ms 读完); `stream end (message_done): … clean` → 本轮被判为干净结束
   - `PhicommChat: chat: drop stale reply gen G (now H) at …` → 打断/退出/新一轮后, 旧轮次大模型结果被丢弃(不再主线程忙等 2s)
   - `PhicommMusicSearch: music pool busy (N), run on temp thread` → 音乐后台线程池 4 个都忙, 临时线程兜底(偶发正常, 频繁说明有任务卡住)
+- v74 新日志关键词:
+  - `Gadget: stream: first sentence ready after …ms (len=N)` → v74 起第一句只要有句末标点且有效字≥1 就切(「好的！」不再被扣留), len 可能很小; 第二句起仍需≥4 个有效字
+  - `Gadget: event delta.text_append (first of turn; rest not logged)` → 每轮只记首个文字碎片事件; `Gadget: stream end (…): text_append=N sentences=M …` → 本轮碎片总数
+  - `NativeANTEngine: doStopWakeup isWakeUp:true|false`(紧挨 `stream: speak first sentence`) → 等 Muse 期间唤醒是否在跑(true=期间可喊「小爱同学」打断, 首句开播时才停)
 
 ## QQ 音乐会员（可选）
 
