@@ -99,6 +99,38 @@ public class PhicommMusicSearchHandler extends SimpleUserEventInboundHandler<NLU
                     return t;
                 }
             });
+    /**
+     * 点歌/切歌/控制/连播/续播的后台任务共享线程池(替代每次 new Thread): 最多 4 个线程, 空闲 30s 回收,
+     * 不排队(SynchronousQueue, 「暂停」等控制不会排在慢搜索后面)。和 RESOLVE_POOL 分开: searchAndPlay
+     * 会在 RESOLVE_POOL 上提交并等待, 同池可能互等。4 个都忙时(极少)退回临时线程并记日志, 不丢任务。
+     */
+    private static final java.util.concurrent.ThreadPoolExecutor MUSIC_POOL =
+            new java.util.concurrent.ThreadPoolExecutor(0, 4, 30L, java.util.concurrent.TimeUnit.SECONDS,
+                    new java.util.concurrent.SynchronousQueue<Runnable>(),
+                    new java.util.concurrent.ThreadFactory() {
+                        private final java.util.concurrent.atomic.AtomicInteger n =
+                                new java.util.concurrent.atomic.AtomicInteger();
+                        @Override
+                        public Thread newThread(Runnable r) {
+                            Thread t = new Thread(r, "MusicTask-" + n.incrementAndGet());
+                            t.setDaemon(true);
+                            return t;
+                        }
+                    },
+                    new java.util.concurrent.RejectedExecutionHandler() {
+                        @Override
+                        public void rejectedExecution(Runnable r, java.util.concurrent.ThreadPoolExecutor e) {
+                            LogMgr.d(TAG, "music pool busy (" + e.getActiveCount() + "), run on temp thread");
+                            Thread t = new Thread(r, "MusicTaskOverflow");
+                            t.setDaemon(true);
+                            t.start();
+                        }
+                    });
+
+    private static void runMusicTask(Runnable r) {
+        MUSIC_POOL.execute(r);
+    }
+
     /** 每次点歌 +1; 打断时也 +1, 在途的搜索结果作废 */
     private volatile int searchGen = 0;
     private volatile long intentAt = 0;
@@ -247,12 +279,12 @@ public class PhicommMusicSearchHandler extends SimpleUserEventInboundHandler<NLU
         try { raw = evt.getText(); } catch (Throwable ignored) { }
         com.phicomm.speaker.device.custom.engine.VoiceTiming.intent("music", raw);
         if (raw != null && isNextIntent(raw) && hasQueue()) {
-            new Thread(new Runnable() {
+            runMusicTask(new Runnable() {
                 @Override
                 public void run() {
                     playNextNow(ctx);
                 }
-            }).start();
+            });
             return;
         }
 
@@ -260,12 +292,12 @@ public class PhicommMusicSearchHandler extends SimpleUserEventInboundHandler<NLU
         if (cmd != CTL_NONE) {
             LogMgr.d(TAG, "control " + CTL_NAMES[cmd] + " (" + raw + "), music ctx=" + hasMusicContext()
                     + " playing=" + isPlaying + " userPaused=" + userPaused);
-            new Thread(new Runnable() {
+            runMusicTask(new Runnable() {
                 @Override
                 public void run() {
                     handleControl(cmd, ctx);
                 }
-            }).start();
+            });
             return;
         }
 
@@ -290,12 +322,12 @@ public class PhicommMusicSearchHandler extends SimpleUserEventInboundHandler<NLU
         final int sg = ++searchGen;
         intentAt = System.currentTimeMillis();
         firstStartLogged = false;
-        new Thread(new Runnable() {
+        runMusicTask(new Runnable() {
             @Override
             public void run() {
                 searchAndPlay(ctx, keyword.trim(), sg);
             }
-        }).start();
+        });
     }
     
     /**
@@ -634,21 +666,21 @@ public class PhicommMusicSearchHandler extends SimpleUserEventInboundHandler<NLU
                         final int gen = playGen;
                         if (loopOne && lastTrack != null) {
                             LogMgr.d(TAG, "track ended, single loop -> replay " + lastTrack.name);
-                            new Thread(new Runnable() {
+                            runMusicTask(new Runnable() {
                                 @Override
                                 public void run() {
                                     if (gen == playGen && isPlaying) replayTrack(null, 0, "loop", false);
                                 }
-                            }).start();
+                            });
                             return;
                         }
                         LogMgr.d(TAG, "track ended (state=" + state + "), auto next");
-                        new Thread(new Runnable() {
+                        runMusicTask(new Runnable() {
                             @Override
                             public void run() {
                                 playNextSilent(gen);
                             }
-                        }).start();
+                        });
                     }
                 });
     }
@@ -1060,12 +1092,12 @@ public class PhicommMusicSearchHandler extends SimpleUserEventInboundHandler<NLU
 
     /** TTS 播完后「接着放」(主线程回调里调用, 网络部分放到后台线程)。 */
     private void resumeTrack(final ANTHandlerContext ctx, final boolean wakeupAfter, final String why) {
-        new Thread(new Runnable() {
+        runMusicTask(new Runnable() {
             @Override
             public void run() {
                 replayTrack(ctx, lastPosMs, why, wakeupAfter);
             }
-        }).start();
+        });
     }
 
     /**
