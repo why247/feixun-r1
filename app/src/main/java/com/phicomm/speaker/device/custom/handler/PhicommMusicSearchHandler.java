@@ -5,6 +5,7 @@ import android.os.Handler;
 import android.os.Looper;
 
 import com.phicomm.speaker.device.R;
+import com.phicomm.speaker.device.custom.music.MusicPrefetcher;
 import com.phicomm.speaker.device.custom.music.NetEaseMusicClient;
 import com.phicomm.speaker.device.custom.music.QQMusicClient;
 import com.phicomm.speaker.device.custom.music.NetEaseMusicClient.MusicPlayResult;
@@ -172,7 +173,7 @@ public class PhicommMusicSearchHandler extends SimpleUserEventInboundHandler<NLU
             new Thread(new Runnable() {
                 @Override
                 public void run() {
-                    playNextAnnounced(ctx);
+                    playNextNow(ctx);
                 }
             }).start();
             return;
@@ -296,11 +297,10 @@ public class PhicommMusicSearchHandler extends SimpleUserEventInboundHandler<NLU
             ctx.stopWakeup();
             ctx.stopASR();
             
-            // 先播报歌曲信息，TTS 结束后在 onTTSEventPlayingEnd 中触发实际播放
-            String ttsText = "即将播放 " + result.name;
-            if (result.artist != null && !result.artist.isEmpty()) {
-                ttsText += "，" + result.artist + " 演唱";
-            }
+            // 播报期间就开始缓冲, TTS 结束(onTTSEventPlayingEnd)立刻开播; 只有第一首播报
+            MusicPrefetcher.prepare(result.playUrl, "music_search");
+            String ttsText = announceText(result.name, result.artist);
+            LogMgr.d(TAG, "announce: " + ttsText);
             ctx.playTTS(ttsText);
             
         } catch (Exception e) {
@@ -325,12 +325,19 @@ public class PhicommMusicSearchHandler extends SimpleUserEventInboundHandler<NLU
             
             LogMgr.d(TAG, "playUrl: " + playUrl);
             
-            // 使用原厂 UniMediaPlayer 播放音频 URL
+            // 原厂 UniMediaPlayer: 播报期间已在缓冲(MusicPrefetcher), 好了就立刻 start,
+            // 没好就 prepare 完成即播; 缓冲不可用时回落到原来的 playUrl
             ensureListener();
             playGen++;
-            UniMediaPlayer.getInstance().playUrl(playUrl, "music_search");
             isPlaying = true;
-            LogMgr.d(TAG, "music playing started");
+            final String u = playUrl;
+            MusicPrefetcher.startWhenReady(u, new Runnable() {
+                @Override
+                public void run() {
+                    UniMediaPlayer.getInstance().playUrl(u, "music_search");
+                    LogMgr.d(TAG, "music playing started (playUrl)");
+                }
+            });
             
         } catch (Exception e) {
             LogMgr.e(TAG, "playMusic error: " + e.getMessage(), e);
@@ -459,18 +466,74 @@ public class PhicommMusicSearchHandler extends SimpleUserEventInboundHandler<NLU
         });
     }
 
-    /** 说「下一首」: 报歌名后播(沿用 TTS 结束再播的流程)。 */
-    private void playNextAnnounced(ANTHandlerContext ctx) {
-        MusicPlayResult next = nextFromQueue();
+    /** 说「下一首/换一首」: 不报歌名, 直接播; 播上后回到唤醒监听。 */
+    private void playNextNow(final ANTHandlerContext ctx) {
+        final MusicPlayResult next = nextFromQueue();
         if (next == null) {
             ctx.playTTS("后面没有歌了，你可以说播放加歌名");
             return;
         }
-        currentResult = next;
-        ctx.stopWakeup();
         ctx.stopASR();
-        String t = "下一首，" + next.name;
-        ctx.playTTS(t);
+        mainHandler.post(new Runnable() {
+            @Override
+            public void run() {
+                currentResult = next;
+                LogMgr.d(TAG, "user next: " + next.name + " - " + next.artist + " (queue left " + queueSize() + ")");
+                ensureListener();
+                MusicPrefetcher.cancel();
+                playGen++;
+                isPlaying = true;
+                UniMediaPlayer.getInstance().playUrl(next.playUrl, "music_search");
+                try {
+                    ctx.enterWakeup(false);
+                } catch (Throwable t) {
+                    LogMgr.e(TAG, "enterWakeup after next failed: " + t);
+                }
+            }
+        });
+    }
+
+    // ── 首曲播报 ──
+    /** 儿歌厂牌/频道关键词: 歌手名含这些词时按「{厂牌}{歌名}」播报, 不说「演唱的」。 */
+    static final String[] KID_LABEL_WORDS = {
+            "儿歌", "宝宝", "宝贝", "童谣", "少儿", "幼儿", "启蒙", "早教", "乐园", "动画",
+            "贝乐虎", "宝宝巴士", "兔小贝", "小伴龙", "碧优蒂", "汪汪队",
+            "儿歌多多", "贝瓦", "巧虎", "碰碰狐", "小猪佩奇", "儿童", "亲子", "胎教", "故事", "童声"
+    };
+
+    /**
+     * 「为您播放{歌手}演唱的{歌名}」/ 儿歌厂牌「为您播放{厂牌}{歌名}」/ 无歌手「为您播放{歌名}」。
+     * 歌名去掉括号内容; 多个歌手只取第一个。
+     */
+    static String announceText(String name, String artist) {
+        String n = cleanTitle(name);
+        if (n.isEmpty()) n = name == null ? "" : name.trim();
+        String a = firstArtist(artist);
+        if (a.isEmpty() || a.contains("未知") || "群星".equals(a) || "佚名".equals(a)
+                || "Various Artists".equalsIgnoreCase(a)) {
+            return "为您播放" + n;
+        }
+        for (String w : KID_LABEL_WORDS) {
+            if (a.contains(w)) return "为您播放" + a + n;
+        }
+        return "为您播放" + a + "演唱的" + n;
+    }
+
+    static String cleanTitle(String name) {
+        if (name == null) return "";
+        String s = name;
+        String prev;
+        do {   // 去掉各种括号及其内容(可嵌套)
+            prev = s;
+            s = s.replaceAll("\\([^()]*\\)|（[^（）]*）|【[^【】]*】|\\[[^\\[\\]]*\\]|<[^<>]*>", "");
+        } while (!s.equals(prev));
+        return s.replace("《", "").replace("》", "").replaceAll("\\s+", " ").trim();
+    }
+
+    static String firstArtist(String artist) {
+        if (artist == null) return "";
+        String[] parts = artist.split("[&/、,，;；]");
+        return parts.length == 0 ? "" : parts[0].trim();
     }
 
     /**
@@ -478,6 +541,7 @@ public class PhicommMusicSearchHandler extends SimpleUserEventInboundHandler<NLU
      */
     private void stopMusic() {
         LogMgr.d(TAG, "stopMusic (queue kept 5min, size=" + queueSize() + ")");
+        MusicPrefetcher.cancel();
         playGen++;                       // 让在途的"自动下一首"作废
         queueKeptUntil = System.currentTimeMillis() + 5 * 60 * 1000L;  // 队列留 5 分钟给「下一首」
         if (isPlaying) {
