@@ -8,6 +8,7 @@ import java.io.OutputStream;
 import java.net.Socket;
 import java.net.URLEncoder;
 import java.nio.charset.StandardCharsets;
+import java.util.regex.Pattern;
 import javax.net.ssl.SSLSocket;
 import javax.net.ssl.SSLSocketFactory;
 import org.json.JSONArray;
@@ -31,10 +32,12 @@ public final class GadgetClient {
     private static void log(String m) {
         try { android.util.Log.d(TAG, m); } catch (Throwable t) { System.out.println(TAG + ": " + m); }
     }
+    /** preview() 用: 换行压成空格(预编译一次, 不再每次 String.replaceAll 编译) */
+    private static final Pattern PREVIEW_NL = Pattern.compile("[\\r\\n]+");
     private static String preview(byte[] b) {
         if (b == null) return "null";
         String t = new String(b, 0, Math.min(b.length, 300), StandardCharsets.UTF_8);
-        return t.replaceAll("[\\r\\n]+", " ") + (b.length > 300 ? "...(" + b.length + "B)" : "");
+        return PREVIEW_NL.matcher(t).replaceAll(" ") + (b.length > 300 ? "...(" + b.length + "B)" : "");
     }
     private final GadgetProto.Reassembler reasm = new GadgetProto.Reassembler();
     private int controlStream = -1;
