@@ -76,8 +76,15 @@ public class NetEaseMusicClient {
 
     private String baseUrl;
 
-    // songId -> (过期时间戳, 直链)
-    private final Map<String, CacheEntry> urlCache = new HashMap<String, CacheEntry>();
+    /** 直链缓存上限: 超了先清过期, 仍超再按插入顺序淘汰最旧 */
+    private static final int URL_CACHE_MAX = 100;
+    // songId -> (过期时间戳, 直链); 有界, 7x24 开机不再只增不减
+    private final Map<String, CacheEntry> urlCache = new java.util.LinkedHashMap<String, CacheEntry>(16, 0.75f, false) {
+        @Override
+        protected boolean removeEldestEntry(Map.Entry<String, CacheEntry> eldest) {
+            return size() > URL_CACHE_MAX;
+        }
+    };
 
     public NetEaseMusicClient() {
         this(BASE_URL);
@@ -243,6 +250,11 @@ public class NetEaseMusicClient {
                 }
 
                 synchronized (urlCache) {
+                    if (urlCache.size() >= URL_CACHE_MAX) {
+                        long nowTs = System.currentTimeMillis();
+                        java.util.Iterator<CacheEntry> it = urlCache.values().iterator();
+                        while (it.hasNext()) if (it.next().expireAt <= nowTs) it.remove();
+                    }
                     urlCache.put(songId,
                         new CacheEntry(playUrl, System.currentTimeMillis() + URL_CACHE_TTL_MS));
                 }

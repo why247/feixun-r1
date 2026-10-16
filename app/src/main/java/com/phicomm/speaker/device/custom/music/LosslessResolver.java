@@ -50,7 +50,14 @@ public class LosslessResolver {
     private static final int GD_BUDGET = 40;                       // 官方 50 次/5 分钟, 留余量
     private static final long KW_MOBI_BACKOFF_MS = 30 * 60 * 1000L;
 
-    private final Map<String, String[]> cache = new HashMap<String, String[]>(); // rid -> {url, label, expire}
+    private static final int CACHE_MAX = 100;
+    // rid -> {url, label, expire}; 有界 LRU(插入顺序): 超了先清过期, 仍超淘汰最旧, 不再整体 clear
+    private final Map<String, String[]> cache = new java.util.LinkedHashMap<String, String[]>(16, 0.75f, false) {
+        @Override
+        protected boolean removeEldestEntry(Map.Entry<String, String[]> eldest) {
+            return size() > CACHE_MAX;
+        }
+    };
     private final ArrayDeque<Long> gdCalls = new ArrayDeque<Long>();
     private long kwMobiDisabledUntil = 0;
     private int kwMobiFailStreak = 0;
@@ -95,8 +102,11 @@ public class LosslessResolver {
             return null;
         }
         if (url.startsWith("https://")) url = "http://" + url.substring(8); // 两家 CDN http 都返回 206, 避开 5.1 证书问题
+        if (cache.size() >= CACHE_MAX) {
+            java.util.Iterator<String[]> it = cache.values().iterator();
+            while (it.hasNext()) if (Long.parseLong(it.next()[2]) <= now) it.remove();
+        }
         cache.put(kuwoRid, new String[]{url, label, String.valueOf(now + CACHE_TTL_MS)});
-        if (cache.size() > 64) cache.clear();
         LogMgr.d(TAG, "lossless ok " + label + ": " + name + " - " + artist);
         return url;
     }
