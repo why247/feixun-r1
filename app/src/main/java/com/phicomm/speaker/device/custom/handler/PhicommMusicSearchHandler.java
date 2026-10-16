@@ -6,6 +6,7 @@ import android.os.Looper;
 
 import com.phicomm.speaker.device.R;
 import com.phicomm.speaker.device.custom.music.NetEaseMusicClient;
+import com.phicomm.speaker.device.custom.music.QQMusicClient;
 import com.phicomm.speaker.device.custom.music.NetEaseMusicClient.MusicPlayResult;
 import com.phicomm.speaker.device.utils.LogUtils;
 import com.unisound.ant.device.bean.MusicItem;
@@ -152,6 +153,12 @@ public class PhicommMusicSearchHandler extends SimpleUserEventInboundHandler<NLU
     @Override
     public boolean onASREventEngineInitDone(ANTHandlerContext ctx) {
         this.ctx = ctx;
+        try {
+            // QQ 音乐凭证(files/qq_cred.json) + 每日续期线程
+            QQMusicClient.get().init(ctx.androidContext().getFilesDir());
+        } catch (Throwable t) {
+            LogMgr.e(TAG, "QQMusicClient init failed: " + t);
+        }
         return super.onASREventEngineInitDone(ctx);
     }
     
@@ -249,17 +256,19 @@ public class PhicommMusicSearchHandler extends SimpleUserEventInboundHandler<NLU
         LogMgr.d(TAG, "searchAndPlay: " + keyword);
         
         try {
-            // 先拿酷我候选列表: 第一首能播的立刻播, 其余进连播队列
+            // 候选列表(QQ 音乐优先, 否则酷我): 第一首能播的立刻播, 其余进连播队列
+            long t0 = System.currentTimeMillis();
             MusicPlayResult result = null;
-            List<NetEaseMusicClient.MusicSearchResult> cands = musicClient.kuwoCandidates(keyword);
+            List<NetEaseMusicClient.MusicSearchResult> cands = musicClient.candidates(keyword);
             int i = 0;
             for (; i < cands.size() && i < 12; i++) {
-                String url = musicClient.kuwoResolve(cands.get(i));
+                String url = musicClient.resolve(cands.get(i));
                 if (url != null) {
                     result = NetEaseMusicClient.toPlay(cands.get(i), url);
                     break;
                 }
             }
+            LogMgr.d(TAG, "first track resolved in " + (System.currentTimeMillis() - t0) + "ms, tried " + (i + 1));
             synchronized (queue) {
                 queue.clear();
                 if (result != null) {
@@ -383,6 +392,10 @@ public class PhicommMusicSearchHandler extends SimpleUserEventInboundHandler<NLU
                 new com.unisound.vui.common.media.IMediaPlayerStateListener() {
                     @Override
                     public void onPlayerState(int state, String tag) {
+                        if ("music_search".equals(tag) || isPlaying) {
+                            LogMgr.d(TAG, "player state=" + state + " tag=" + tag + " isPlaying=" + isPlaying
+                                    + " queue=" + queueSize());
+                        }
                         if (!"music_search".equals(tag) || !isPlaying) return;
                         // 出错时 onError 返回 false, MediaPlayer 随后也会回调 onCompletion(4), 所以只认 4
                         if (state != 4) return;
@@ -406,8 +419,22 @@ public class PhicommMusicSearchHandler extends SimpleUserEventInboundHandler<NLU
                 c = queue.poll();
             }
             if (c == null) return null;
-            String url = musicClient.kuwoResolve(c);
+            long t0 = System.currentTimeMillis();
+            String url = null;
+            try {
+                url = musicClient.resolve(c);
+            } catch (Throwable t) {
+                LogMgr.e(TAG, "next resolve error: " + t);
+            }
+            LogMgr.d(TAG, "next resolve " + (url != null ? "ok" : "miss") + " in "
+                    + (System.currentTimeMillis() - t0) + "ms: " + c.name + " (queue left " + queueSize() + ")");
             if (url != null) return NetEaseMusicClient.toPlay(c, url);
+        }
+    }
+
+    private int queueSize() {
+        synchronized (queue) {
+            return queue.size();
         }
     }
 
@@ -450,7 +477,7 @@ public class PhicommMusicSearchHandler extends SimpleUserEventInboundHandler<NLU
      * 停止音乐播放
      */
     private void stopMusic() {
-        LogMgr.d(TAG, "stopMusic");
+        LogMgr.d(TAG, "stopMusic (queue kept 5min, size=" + queueSize() + ")");
         playGen++;                       // 让在途的"自动下一首"作废
         queueKeptUntil = System.currentTimeMillis() + 5 * 60 * 1000L;  // 队列留 5 分钟给「下一首」
         if (isPlaying) {
