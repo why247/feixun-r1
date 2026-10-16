@@ -20,6 +20,7 @@ import nluparser.scheme.Intent;
 import nluparser.scheme.LocalASR;
 import nluparser.scheme.Mixture;
 import nluparser.scheme.NLU;
+import com.phicomm.speaker.device.custom.asr.TencentAsr;
 import com.phicomm.speaker.device.custom.event.PersonaActivationEvent;
 import com.phicomm.speaker.device.custom.persona.PersonaConfig;
 import com.phicomm.speaker.device.custom.persona.PersonaManager;
@@ -210,6 +211,9 @@ public final class NLUDispatcher extends ANTEventDispatcher {
     /* access modifiers changed from: private */
     /* access modifiers changed from: public */
     private void c(ANTHandlerContext aNTHandlerContext, NLU nlu) {
+        // v75: 任何分发(腾讯路由/云知声原结果/本地结果/超时错误)都结束本轮: 作废扣留, 关掉腾讯会话(不再发音频)
+        txHoldGen = 0;
+        TencentAsr.get().finishRound("dispatched");
         a();
         aNTHandlerContext.pipeline().fireASREvent(1102);
         a(aNTHandlerContext, true);
@@ -269,6 +273,8 @@ public final class NLUDispatcher extends ANTEventDispatcher {
     public boolean onASREventCancel(ANTHandlerContext ctx) {
         a();
         cancelRecogStallWatchdog();
+        txDropHold("engine cancel");
+        TencentAsr.get().finishRound("engine cancel");
         return false;
     }
 
@@ -279,6 +285,17 @@ public final class NLUDispatcher extends ANTEventDispatcher {
         a();
         cancelRecogStallWatchdog();
         a(ctx, false);
+        txDropHold("new recording");
+        // v75: 只在 ASR 状态(唤醒后/多轮)开腾讯识别; 唤醒监听的录音不开(省额度)
+        try {
+            if (ctx.engine().isASR()) {
+                TencentAsr.get().beginSession(ctx.androidContext().getFilesDir(), ctx.engine());
+            } else {
+                TencentAsr.get().finishRound("not asr");
+            }
+        } catch (Throwable t) {
+            LogMgr.e(TX, "begin session failed: " + t);
+        }
         return super.onASREventRecordingStart(ctx);
     }
 
@@ -288,7 +305,15 @@ public final class NLUDispatcher extends ANTEventDispatcher {
         LogMgr.i("NLUDispatcher", "onASREventRecordingStop -> schedule recog-stall watchdog");
         // ⭐ v82: 录音停止 = 等最终识别结果, 云端死了就会卡死, 挂看门狗兜底
         scheduleRecogStallWatchdog(ctx);
+        TencentAsr.get().endAudio("recording stop");
         return super.onASREventRecordingStop(ctx);
+    }
+
+    /* v75: 云知声 VAD 判定说完 → 腾讯这边立即发 end(比 recording stop 早 0.5~1.3s) */
+    @Override // com.unisound.vui.handler.ANTEventDispatcher
+    public boolean onASREventSpeechEnd(ANTHandlerContext ctx) {
+        TencentAsr.get().endAudio("speech end");
+        return super.onASREventSpeechEnd(ctx);
     }
 
     /* access modifiers changed from: protected */
@@ -381,7 +406,6 @@ public final class NLUDispatcher extends ANTEventDispatcher {
     /* access modifiers changed from: protected */
     @Override // com.unisound.vui.handler.ANTEventDispatcher
     public boolean onASRResultNet(ANTHandlerContext ctx, String result) {
-        String str;
         LogMgr.d("NLUDispatcher", "onASRResultNet:" + result);
 
         if (this.f423a) {
@@ -389,6 +413,16 @@ public final class NLUDispatcher extends ANTEventDispatcher {
             return true;
         }
 
+        // v75: 本轮有腾讯识别会话 → 扣住云知声这条「会被分发」的结果, 等腾讯最终文字再决定
+        if (txTryHold(ctx, result)) {
+            return true;
+        }
+        return processNetResult(ctx, result);
+    }
+
+    /** 原 onASRResultNet 的处理逻辑(未改动) */
+    private boolean processNetResult(ANTHandlerContext ctx, String result) {
+        String str;
         d(ctx);
         Mixture<Intent, Result> from = this.c.from(result);
         if (from == null) {
@@ -446,6 +480,199 @@ public final class NLUDispatcher extends ANTEventDispatcher {
 
             return false;
         }
+    }
+
+    // ======================= v75: 腾讯云实时语音识别 =======================
+    // 云知声识别照常跑(作为回退); 腾讯拿同一份音频并行识别。云知声给出「会被分发」的那条结果时扣住,
+    // 等腾讯 final(最多到说完 + timeout_ms), 然后:
+    //   腾讯无结果/出错/超时            → 原样用云知声结果
+    //   两边文字一致                    → 用云知声结果(NLU 槽位更全)
+    //   云知声是原生技能(天气/设置/闹钟…) → 用云知声结果(keep_native, 默认开)
+    //   否则用腾讯文字合成一条 NLU, 走原来的分发流程, 由现有 handler 按文字本地路由:
+    //     控制词(暂停/继续/下一首/音量…) → PhicommMusicSearchHandler 本地播放器
+    //     点歌关键词 → 音乐搜索; 天气词 → 天气; 其他 → PhicommChatHandler(Muse)
+    //   云知声判成 music 而文字不同 → 合成 music(用腾讯文字做搜索关键词)
+    private static final String TX = "TencentASR";
+    private static final String[] TX_WEATHER_WORDS = {
+        "天气", "温度", "下雨", "晴天", "阴天", "多云", "几度", "摄氏度",
+        "刮风", "下雪", "雾霾", "空气质量", "天气预报"
+    };
+    private static final String TX_WAKE_WORD = "小爱同学";
+    /** 当前扣留代次(0 = 没有扣留) */
+    private int txHoldGen = 0;
+    private int txSeq = 0;
+
+    /** 新录音/引擎取消: 作废扣留(不分发), 恢复「未处理」状态 */
+    private void txDropHold(String why) {
+        if (txHoldGen != 0) {
+            LogMgr.d(TX, "hold dropped (" + why + "), unisound result discarded");
+            txHoldGen = 0;
+            this.f423a = false;
+        }
+    }
+
+    /** 与原逻辑一致的「这条结果会被分发吗」(unsupported domain / 有 NLU 且不是要等 full 的过滤服务) */
+    private boolean txDispatchable(Mixture<Intent, Result> m) {
+        if (m == null) return true;
+        if (!b(m)) return false;
+        return !a(m, m.getNluList().get(0));
+    }
+
+    private boolean txTryHold(final ANTHandlerContext ctx, final String result) {
+        final int sid = TencentAsr.get().activeSessionId();
+        if (sid == 0) return false;
+        Mixture<Intent, Result> m;
+        try {
+            m = this.c.from(result);
+        } catch (Throwable t) {
+            return false;
+        }
+        if (!txDispatchable(m)) return false;
+        String svc = null;
+        String txt = null;
+        try {
+            if (m != null) {
+                NLU<Intent, Result> n = m.getNluList().get(0);
+                svc = n.getService();
+                txt = n.getText();
+            } else {
+                txt = String.valueOf(((JSONObject) JsonTool.parseToJSONObject(result)
+                        .getJSONArray("net_nlu").get(0)).get("text"));
+            }
+        } catch (Throwable ignored) {
+        }
+        final String uniService = svc;
+        final String uniText = txt;
+        d(ctx);   // 原有 15s 兜底照挂(扣留最多 timeout_ms, 远小于 15s)
+        this.f423a = true;
+        final int gen = ++txSeq;
+        txHoldGen = gen;
+        final long holdAt = System.currentTimeMillis();
+        LogMgr.d(TX, "hold unisound result (service=" + uniService + " text=" + uniText
+                + "), wait tencent session " + sid);
+        TencentAsr.get().awaitResult(sid, new TencentAsr.ResultCallback() {
+            @Override
+            public void onResult(String text, String reason) {
+                if (txHoldGen != gen) {
+                    LogMgr.d(TX, "tencent result for dropped hold ignored (" + reason + ")");
+                    return;
+                }
+                txHoldGen = 0;
+                NLUDispatcher.this.f423a = false;
+                try {
+                    txRoute(ctx, result, uniService, uniText, text, reason, sid,
+                            System.currentTimeMillis() - holdAt);
+                } catch (Throwable t) {
+                    LogMgr.e(TX, "route failed (" + t + "), fallback unisound");
+                    processNetResult(ctx, result);
+                }
+            }
+        });
+        return true;
+    }
+
+    private void txRoute(ANTHandlerContext ctx, String result, String uniService, String uniText,
+                         String text, String reason, int sid, long waited) throws JSONException {
+        if (text == null) {
+            LogMgr.d(TX, "fallback reason=" + reason + " -> unisound (waited " + waited + "ms)");
+            processNetResult(ctx, result);
+            return;
+        }
+        String t = txClean(text);
+        if (t.isEmpty()) {
+            LogMgr.d(TX, "fallback reason=empty text after cleanup -> unisound (waited " + waited + "ms)");
+            processNetResult(ctx, result);
+            return;
+        }
+        if (txSame(t, uniText)) {
+            LogMgr.d(TX, "same text as unisound -> keep unisound nlu service=" + uniService
+                    + " (waited " + waited + "ms)");
+            processNetResult(ctx, result);
+            return;
+        }
+        boolean isChat = SName.CHAT.equals(uniService);
+        boolean isMusic = SName.MUSIC.equals(uniService);
+        boolean nativeSkill = uniService != null && !isChat && !isMusic;
+        if (nativeSkill && (TencentAsr.get().keepNative() || SName.CHAT_ILLEGAL.equals(uniService))) {
+            LogMgr.d(TX, "keep unisound native service=" + uniService + " (tencent text=" + t
+                    + ", unisound text=" + uniText + ", waited " + waited + "ms)");
+            processNetResult(ctx, result);
+            return;
+        }
+        String svc;
+        if (isMusic) {   // 控制词在 music 服务下同样由 PhicommMusicSearchHandler 本地处理
+            svc = SName.MUSIC;
+        } else if (txContainsAny(t, TX_WEATHER_WORDS)) {
+            svc = SName.WEATHER;
+        } else {
+            svc = SName.CHAT;
+        }
+        LogMgr.d(TX, "route tencent text=" + t + " -> " + svc + " (unisound service=" + uniService
+                + " text=" + uniText + ", " + reason + ", waited " + waited + "ms)");
+        processNetResult(ctx, txSynth(svc, t, sid));
+    }
+
+    /** 合成一条与云知声 full 结果同结构的 JSON(net_asr full + net_nlu), 交给原 processNetResult */
+    private static String txSynth(String svc, String text, int sid) throws JSONException {
+        JSONObject asr = new JSONObject();
+        asr.put("engine_mode", "tencent");
+        asr.put("result_type", "full");
+        asr.put("last_result", true);
+        asr.put("recognition_result", text);
+        asr.put("sessionID", "tencent-" + sid);
+        JSONObject nlu = new JSONObject();
+        nlu.put("rc", 0);
+        nlu.put("returnCode", 0);
+        if (SName.CHAT.equals(svc)) {
+            nlu.put("code", "ANSWER");
+            JSONObject g = new JSONObject();
+            g.put("type", "T");
+            g.put("text", "");
+            nlu.put("general", g);
+        }
+        nlu.put("service", svc);
+        nlu.put("history", svc);
+        nlu.put("source", "tencent_asr");
+        nlu.put("text", text);
+        nlu.put("responseId", "tencent-" + sid);
+        JSONObject root = new JSONObject();
+        root.put("net_asr", new JSONArray().put(asr));
+        root.put("net_nlu", new JSONArray().put(nlu));
+        return root.toString();
+    }
+
+    /** 去掉开头的唤醒词(oneshot)和首尾标点/空白 */
+    static String txClean(String s) {
+        if (s == null) return "";
+        String t = s.trim();
+        t = TX_EDGE_PUNCT.matcher(t).replaceAll("");
+        if (t.startsWith(TX_WAKE_WORD)) {
+            t = TX_EDGE_PUNCT.matcher(t.substring(TX_WAKE_WORD.length())).replaceAll("");
+        }
+        return t;
+    }
+
+    private static final java.util.regex.Pattern TX_EDGE_PUNCT = java.util.regex.Pattern.compile(
+            "^[\\s\\p{P}\\p{S}\\u3000]+|[\\s\\p{P}\\p{S}\\u3000]+$");
+
+    /** 去掉所有标点/空白后比较 */
+    static boolean txSame(String a, String b) {
+        if (a == null || b == null) return false;
+        return txLetters(a).equalsIgnoreCase(txLetters(b));
+    }
+
+    private static String txLetters(String s) {
+        StringBuilder sb = new StringBuilder(s.length());
+        for (int i = 0; i < s.length(); i++) {
+            char ch = s.charAt(i);
+            if (Character.isLetterOrDigit(ch)) sb.append(ch);
+        }
+        return sb.toString();
+    }
+
+    private static boolean txContainsAny(String t, String[] words) {
+        for (String w : words) if (t.contains(w)) return true;
+        return false;
     }
 
     /* access modifiers changed from: protected */
