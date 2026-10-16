@@ -47,7 +47,10 @@ public final class GadgetClient {
     private static final String WS_KEY = "dGhlIHNhbXBsZSBub25jZQ==";
 
     private static final long REPLY_TIMEOUT_MS = 60_000;
-    private static final long SETTLE_QUIET_MS = 600;   // 收到 message_done 后只再听 0.6 秒
+    /** 流式: 已有文字且 text_append 静默这么久就当本条说完, 立即返回开口(实测文字 0.3 秒内到齐) */
+    private static final long TEXT_QUIET_MS = 250;
+    /** 发新问题前读掉上一轮提前返回后残留的事件, 读到连续这么久没新帧为止 */
+    private static final long PRE_DRAIN_QUIET_MS = 150;
     private static final long KEEPALIVE_MS = 25_000;
 
     /** 首轮随人设一起发的儿童规则(每条连接只发一次, 之后靠 Muse 自己的会话记忆) */
@@ -290,8 +293,10 @@ public final class GadgetClient {
                 .put("output_modality", "text");
         if (creds != null) req.put("device_id", creds.nodeId());
         byte[] body = req.toString().getBytes(StandardCharsets.UTF_8);
-        subBuf.reset();  // drop any late events from the previous turn
         try {
+            // 上一轮是提前返回的(文字静默 250ms / message_done 即返回), 连接上可能还挂着它的
+            // message_done / 状态事件 / 后续消息; 先读掉丢弃, 免得这一轮把上一轮的残余当成回复。
+            drainPending();
             String r = doChat(body);
             if (withPersona) personaSent = true;
             return r;
@@ -317,7 +322,8 @@ public final class GadgetClient {
                 new String[]{"Content-Type", "application/json",
                         "x-request-id", java.util.UUID.randomUUID().toString(),
                         "x-app-id", "musegadget"}, body, true);
-        long deadline = System.currentTimeMillis() + REPLY_TIMEOUT_MS;
+        long startedAt = System.currentTimeMillis();
+        long deadline = startedAt + REPLY_TIMEOUT_MS;
         List<String> messages = new ArrayList<>();
         StringBuilder cur = new StringBuilder();
         boolean inTurn = false;
@@ -328,7 +334,11 @@ public final class GadgetClient {
             // Hard deadline: always exit, never hang (method is synchronized).
             // Return whatever text arrived (may be partial or empty).
             if (now >= deadline) break;
-            if (inTurn && quietUntil > 0 && now >= quietUntil) break;
+            if (inTurn && quietUntil > 0 && now >= quietUntil) {
+                log("reply ready (" + (cur.length() > 0 ? "text quiet " + TEXT_QUIET_MS + "ms" : "message_done")
+                        + ") in " + (now - startedAt) + " ms");
+                break;
+            }
             long wait = Math.min(5_000, deadline - now);
             if (inTurn && quietUntil > 0) wait = Math.min(wait, quietUntil - now);
             sock.setSoTimeout((int) Math.max(100, wait));
@@ -397,25 +407,20 @@ public final class GadgetClient {
                     log("event " + name);
                     if ("user".equals(payload.optString("role", ""))) continue;
                     if ("agent.status".equals(name) || "task.status".equals(name)) {
-                        // 状态事件: 记下内容便于调参; message_done 之后若显示「空闲/完成」就立刻收尾(省掉 0.6 秒)
+                        // 状态事件只记日志(截断 160 字); 是否收尾只看文字静默 / message_done
                         String st = payload.toString();
                         log(name + " " + (st.length() > 160 ? st.substring(0, 160) : st));
-                        if (inTurn && quietUntil > 0) {
-                            String low = st.toLowerCase();
-                            if (low.contains("idle") || low.contains("complete") || low.contains("finished")
-                                    || low.contains("\"done\"") || low.contains("ready")) {
-                                if (!messages.isEmpty()) quietUntil = System.currentTimeMillis();
-                            }
-                            // TODO: 拿到真实 payload 日志后, 再决定「忙」时是否延长等待(防多消息被截断)
-                        }
                         continue;
                     }
                     if ("delta.text_append".equals(name)) {
                         String t = payload.optString("text", "");
                         if (!t.isEmpty()) {
+                            if (cur.length() == 0 && messages.isEmpty())
+                                log("first text after " + (System.currentTimeMillis() - startedAt) + " ms");
                             inTurn = true;
                             cur.append(t);
-                            quietUntil = 0;
+                            // 流式: 文字静默 250ms 就开口, 不等 message_done / 状态事件
+                            quietUntil = System.currentTimeMillis() + TEXT_QUIET_MS;
                         }
                     } else if ("delta.message_done".equals(name)
                             || "message.assistant".equals(name)) {
@@ -437,8 +442,11 @@ public final class GadgetClient {
                         String full = cur.length() > 0 ? cur.toString() : txt;
                         if (!full.trim().isEmpty()) messages.add(full);
                         cur.setLength(0);
-                        inTurn = true;
-                        quietUntil = System.currentTimeMillis() + SETTLE_QUIET_MS;
+                        // 收到 message_done 且已有内容: 立即返回
+                        if (!messages.isEmpty()) {
+                            inTurn = true;
+                            quietUntil = System.currentTimeMillis();
+                        }
                     }
                 }
             }
@@ -534,6 +542,42 @@ public final class GadgetClient {
             sock.setSoTimeout(300);
         }
         subBuf.reset();
+    }
+
+    /**
+     * 发问前调用(已持有锁): 读掉连接上已到达的残余帧(上一轮提前返回后的 message_done、状态事件等),
+     * 解密以保持 Noise nonce 同步, 内容丢弃。连续 150ms 没新帧即结束; 最多 1.5 秒。
+     */
+    private void drainPending() throws Exception {
+        if (sock == null || noise == null) return;
+        long t0 = System.currentTimeMillis();
+        int frames = 0;
+        try {
+            sock.setSoTimeout((int) PRE_DRAIN_QUIET_MS);
+            while (System.currentTimeMillis() - t0 < 1500) {
+                byte[] frame;
+                try {
+                    frame = wsRecv();
+                } catch (java.net.SocketTimeoutException e) {
+                    break;
+                }
+                frames++;
+                byte[] plain = noise.decrypt(frame);
+                try {
+                    byte[] whole = reasm.feed(plain);
+                    if (whole != null) {
+                        GadgetProto.ServerFrame sf = GadgetProto.decodeServiceResponse(whole);
+                        if (sf.isReset && (sf.streamId == subStream || sf.streamId == controlStream))
+                            throw new IOException("stream " + sf.streamId + " reset while idle");
+                    }
+                } catch (IllegalArgumentException ignored) {
+                }
+            }
+        } finally {
+            subBuf.reset();
+        }
+        if (frames > 0) log("pre-chat drain: dropped " + frames + " leftover frames in "
+                + (System.currentTimeMillis() - t0) + " ms");
     }
 
     public synchronized void close() {
