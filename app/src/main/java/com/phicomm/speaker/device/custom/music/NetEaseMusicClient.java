@@ -475,6 +475,8 @@ public class NetEaseMusicClient {
         res.artist = c.artist;
         res.playUrl = url;
         res.duration = c.duration;
+        res.cand = c;
+        res.resolvedAt = System.currentTimeMillis();
         return res;
     }
 
@@ -751,6 +753,8 @@ public class NetEaseMusicClient {
         public String playUrl;    // 播放 URL
         public long duration;     // 时长（秒）
         public String picUrl;     // 封面图 URL
+        public MusicSearchResult cand;   // 来源候选(重新解链用), gequbao 单曲为 null
+        public long resolvedAt;          // 直链解析时间(墙钟)
 
         @Override
         public String toString() {

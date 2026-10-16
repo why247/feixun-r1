@@ -213,6 +213,30 @@ public final class MusicPrefetcher {
         active = false;
     }
 
+    // ------------------------------------------------------------------ 播放位置(暂停/继续用)
+    /** 原厂播放器当前位置(毫秒), 取不到返回 -1。 */
+    public static int currentPositionMs() {
+        try {
+            MediaPlayer mp = player(UniMediaPlayer.getInstance());
+            return mp == null ? -1 : mp.getCurrentPosition();
+        } catch (Throwable t) {
+            return -1;
+        }
+    }
+
+    /** 跳到指定位置(播放中/已 prepare 时有效), 成功返回 true。 */
+    public static boolean seekTo(int ms) {
+        try {
+            MediaPlayer mp = player(UniMediaPlayer.getInstance());
+            if (mp == null) return false;
+            mp.seekTo(ms);
+            return true;
+        } catch (Throwable t) {
+            LogMgr.e(TAG, "seekTo failed: " + t);
+            return false;
+        }
+    }
+
     // ------------------------------------------------------------------ 反射
     private static MediaPlayer player(UniMediaPlayer up) throws Exception {
         Field f = UniMediaPlayer.class.getDeclaredField("mMediaPlayer");

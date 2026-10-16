@@ -505,6 +505,13 @@ public class PhicommChatHandler extends SimpleUserEventInboundHandler<NLU> {
                 return true;
             }
             
+            // 播放控制词(暂停/继续/继续播放/再放一遍/单曲循环/大声点/下一首...): 放行给
+            // PhicommMusicSearchHandler 处理, 不进大模型, 也不会被当成点歌。多轮模式下同样放行。
+            if (PhicommMusicSearchHandler.controlCommand(text) != 0) {
+                LogMgr.d(TAG, "播放控制词,放行: " + text);
+                return false;
+            }
+
             // ⚠️ 重要: 先检查音乐/天气关键词,即使在多轮模式下也要放行
             // 包含音乐关键词 → 放行给 PhicommMusicSearchHandler(不保存记忆)
             if (containsAny(text, MUSIC_KEYWORDS)) {
