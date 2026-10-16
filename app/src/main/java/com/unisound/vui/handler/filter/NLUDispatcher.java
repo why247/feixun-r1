@@ -340,6 +340,13 @@ public final class NLUDispatcher extends ANTEventDispatcher {
         JSONObject parseToJSONObject = JsonTool.parseToJSONObject(error);
         String jsonValue = JsonTool.getJsonValue(parseToJSONObject, "errorCode");
         String jsonValue2 = JsonTool.getJsonValue(parseToJSONObject, "errorMsg");
+        // ⭐ v76: -65806「上传在线oneshot唤醒词错误：新增加的唤醒词在已经生效的词列表中」= 开机重复上传同一个
+        // 唤醒词, 唤醒词其实已生效(随后 wakeUpEventSetWakeUpWordDone 照常)。原来当识别错误分发 → cancelEngine
+        // + 错误 NLU → 开机播「Emm，我暂时还不会」。现在静默吞掉: 不分发、不 cancelEngine、不挂 15s 超时任务。
+        if ("-65806".equals(jsonValue)) {
+            LogMgr.d("NLUDispatcher", "ignore benign error -65806 (wakeup word already active), no TTS");
+            return true;
+        }
         if (earlyGuardActive()) {
             LogMgr.d("NLUDispatcher", "early control: drop late error " + jsonValue + " of handled turn");
             return true;
