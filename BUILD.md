@@ -78,7 +78,7 @@ adb logcat -d -v time -s Gadget PhicommChat OpenAIClient MusicClient PhicommMusi
   - `Gadget: stream end (message_done|text quiet 3000ms|deadline 60000ms): sentences=N chars=M in …ms` → 流结束原因
   - `Gadget: stream broken after N sentence(s), keep partial` → 中途断线, 已播的不重问, 下轮重连
   - `PhicommChat: stream turn T begin` / `stream: first sentence ready in …ms (len=N)` / `stream: queued #k len=N`
-  - `PhicommChat: stream: speak first sentence …ms after question` → 「嗯，我想想」之后第一句真正开口
+  - `PhicommChat: stream: speak first sentence …ms after question` → 发问到第一句真正开口(v73 起无垫话、无提示音, 第一句到了直接播)
   - `PhicommChat: stream: speak #k len=N` / `stream: #k TTS end` → 每句开播 / 结束
   - `PhicommChat: stream: next sentence not here yet (…), wait, no ASR` → 中间句播完下一句未到, 等待(不进 ASR)
   - `PhicommChat: stream: all N sentence(s) spoken in …ms -> multi-turn/wakeup` → 最后一句结束, 才进多轮 ASR / 唤醒

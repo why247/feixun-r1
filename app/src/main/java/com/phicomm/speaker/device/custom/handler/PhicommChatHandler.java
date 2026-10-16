@@ -137,16 +137,9 @@ public class PhicommChatHandler extends SimpleUserEventInboundHandler<NLU> {
         return true;
     }
 
-    // 「嗯，我想想」: 调 Muse 前先说一句。它的 TTS 结束事件要吞掉(不能触发多轮 ASR /
-    // handleTtsPlayingEnd), 正式回答等它说完再播(不互相打断丢字)。
-    private static final String FILLER_TEXT = "嗯，我想想";
-    /** 兜底: 这么久还没收到「嗯，我想想」的结束事件就当它播完了 */
-    private static final long FILLER_MAX_MS = 6000;
+    // v73: 小爱音箱风格 — 识别结束后不说「嗯，我想想」也不放提示音, 第一句回答到了直接播。
     /** Muse 首字/整轮超时(没有任何句子)时的简短提示, 不再回落重问 */
     private static final String SLOW_NET_TEXT = "网络有点慢，等会再问我吧";
-    private final Object fillerLock = new Object();
-    private boolean fillerPlaying = false;
-    private long fillerStartedAt = 0;
     
     public PhicommChatHandler() {
         this.sessionName = SessionRegister.SESSION_CHAT;
@@ -191,79 +184,10 @@ public class PhicommChatHandler extends SimpleUserEventInboundHandler<NLU> {
         return super.onASREventEngineInitDone(ctx);
     }
     
-    /** 调 Muse 前立刻说「嗯，我想想」(替换原来的嘀声)。 */
-    private void playFiller(ANTHandlerContext ctx) {
-        synchronized (fillerLock) {
-            fillerPlaying = true;
-            fillerStartedAt = System.currentTimeMillis();
-        }
-        try {
-            ctx.playTTS(FILLER_TEXT);
-            LogMgr.d(TAG, "filler TTS: " + FILLER_TEXT);
-        } catch (Throwable t) {
-            LogMgr.e(TAG, "filler TTS failed: " + t);
-            synchronized (fillerLock) {
-                fillerPlaying = false;
-                fillerLock.notifyAll();
-            }
-        }
-    }
-
-    /** 播正式回答前调用(工作线程): 「嗯，我想想」还在播就等它结束, 结束后立刻返回。 */
-    private void waitFillerDone() {
-        synchronized (fillerLock) {
-            if (!fillerPlaying) return;
-            long t0 = System.currentTimeMillis();
-            long until = fillerStartedAt + FILLER_MAX_MS;
-            while (fillerPlaying) {
-                long left = until - System.currentTimeMillis();
-                if (left <= 0) break;
-                try {
-                    fillerLock.wait(left);
-                } catch (InterruptedException e) {
-                    Thread.currentThread().interrupt();
-                    break;
-                }
-            }
-            if (fillerPlaying) {
-                LogMgr.e(TAG, "filler end event not received in " + FILLER_MAX_MS + "ms, speak anyway");
-                fillerPlaying = false;
-            } else {
-                LogMgr.d(TAG, "answer waited " + (System.currentTimeMillis() - t0) + "ms for filler to finish");
-            }
-        }
-    }
-
-    /** TTS 结束事件若属于「嗯，我想想」则吞掉并唤醒等待中的回答, 返回 true。 */
-    private boolean consumeFillerEnd() {
-        synchronized (fillerLock) {
-            if (!fillerPlaying) return false;
-            fillerPlaying = false;
-            fillerLock.notifyAll();
-        }
-        LogMgr.d(TAG, "filler TTS end (ignored for multi-turn)");
-        return true;
-    }
-
-    /** 「嗯，我想想」是否还在播(超过 FILLER_MAX_MS 视为已播完, 兜底丢失的结束事件)。 */
-    private boolean isFillerPlaying() {
-        synchronized (fillerLock) {
-            if (!fillerPlaying) return false;
-            if (System.currentTimeMillis() - fillerStartedAt >= FILLER_MAX_MS) {
-                LogMgr.e(TAG, "filler end event not received in " + FILLER_MAX_MS + "ms, treat as done");
-                fillerPlaying = false;
-                fillerLock.notifyAll();
-                return false;
-            }
-            return true;
-        }
-    }
-
     // ================= 按句流式播报 (Muse/Gadget) =================
-    // 句子队列: 「嗯，我想想」播完立即播第一句, 每句 TTS 结束事件触发下一句;
+    // 句子队列: 第一句到了立即播(不再有「嗯，我想想」垫话), 每句 TTS 结束事件触发下一句;
     // 只有最后一句(流已结束且队列空)的结束才走 handleTtsPlayingEnd(多轮 ASR / 唤醒)。
     // 下一句还没到就等, 绝不进 ASR。streamTurn 是轮次 id: 新一轮/打断时 +1, 旧轮次残余句子全部丢弃。
-    // 锁顺序: streamLock -> fillerLock (反过来不允许)。
     private final Object streamLock = new Object();
     private int streamTurn = 0;
     private boolean streamActive = false;     // 本轮由流式播报接管 TTS 结束事件
@@ -393,7 +317,6 @@ public class PhicommChatHandler extends SimpleUserEventInboundHandler<NLU> {
         synchronized (streamLock) {
             if (turn != streamTurn || !streamActive) return false;
             if (sentenceSpeaking) return false;
-            if (isFillerPlaying()) return false;          // 等「嗯，我想想」说完
             next = sentenceQueue.poll();
             if (next == null) {
                 if (!streamEnded) {
@@ -822,15 +745,8 @@ public class PhicommChatHandler extends SimpleUserEventInboundHandler<NLU> {
                             // 调用带 persona systemPrompt + 该 persona 历史
                             if (useGadget && gadgetClient != null) {
                                 // Gadget 直连 Brio: 只回文字, 按句流式交给原厂 TTS 播放
+                                // 不播垫话/提示音: 第一句切出后 advanceStream 立即开播
                                 final int turn = beginStream();
-                                playFiller(ctx);      // 先说「嗯，我想想」, 让小朋友知道听到了
-                                // 兜底: 「嗯，我想想」的结束事件丢了也要在 6 秒后开始播句子
-                                timeoutHandler.postDelayed(new Runnable() {
-                                    @Override
-                                    public void run() {
-                                        if (advanceStream(turn, "filler backstop")) runStreamFinalOnMain(turn);
-                                    }
-                                }, FILLER_MAX_MS + 50);
                                 boolean gadgetTimedOut = false;
                                 try {
                                     response = gadgetClient.chatStream(
@@ -903,7 +819,6 @@ public class PhicommChatHandler extends SimpleUserEventInboundHandler<NLU> {
                     // 本轮在等大模型期间被打断/退出/新一轮取代: 结果作废, 不播
                     if (staleChat(myGen, "reply")) return;
                     if (slowTip) {
-                        waitFillerDone();
                         ctx.stopWakeup();
                         ctx.stopASR();
                         isMultiTurnMode = false;      // 提示完回到唤醒, 不进多轮
@@ -913,8 +828,6 @@ public class PhicommChatHandler extends SimpleUserEventInboundHandler<NLU> {
                         ctx.playTTS(SLOW_NET_TEXT);
                         return;
                     }
-                    // 「嗯，我想想」还没说完就等它说完再开口(不互相打断)
-                    waitFillerDone();
                     if (response != null && !response.isEmpty()) {
                         // 停止唤醒和 ASR
                         ctx.stopWakeup();
@@ -966,7 +879,6 @@ public class PhicommChatHandler extends SimpleUserEventInboundHandler<NLU> {
                     LogMgr.e(TAG, "chat failed: " + e);
                     e.printStackTrace();
                     if (staleChat(myGen, "error tip")) return;
-                    waitFillerDone();
                     PlaybackStateMonitor.setTTSPlaying(false);
                     ctx.playTTS("我暂时连不上网络大脑，等一下再问我吧");
                     if (isIdiomGameMode) {
@@ -984,13 +896,6 @@ public class PhicommChatHandler extends SimpleUserEventInboundHandler<NLU> {
         LogMgr.d(TAG, "TTS playing end (原厂), isIdiomGameMode=" + isIdiomGameMode + 
                  ", isMultiTurnMode=" + isMultiTurnMode);
         
-        // 「嗯，我想想」的结束事件: 吞掉, 不进多轮 ASR / 调侃流程
-        if (consumeFillerEnd()) {
-            int turn;
-            synchronized (streamLock) { turn = streamTurn; }
-            if (advanceStream(turn, "filler end")) return handleTtsPlayingEnd();
-            return true;
-        }
         // 流式播报中: 中间句子的结束事件只触发下一句, 绝不进 ASR; 最后一句才走结束流程
         Boolean streamResult = onStreamTtsEnd();
         if (streamResult != null) return streamResult.booleanValue();
@@ -1148,10 +1053,6 @@ public class PhicommChatHandler extends SimpleUserEventInboundHandler<NLU> {
                      ", isMultiTurnMode=" + isMultiTurnMode);
             // ⭐ v86: 用户打断 = 新交互开始, 未播的调侃立即作废
             PostDialogueTeaser.get().cancelPending();
-            synchronized (fillerLock) {   // 打断时「嗯，我想想」作废, 别让回答线程干等
-                fillerPlaying = false;
-                fillerLock.notifyAll();
-            }
             ctx.cancelTTS();
             
             // 取消超时定时器
