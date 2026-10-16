@@ -95,6 +95,9 @@ public final class GadgetClient {
     private volatile int cancelGen = 0;
     /** 网络恢复 / 收到断线信号: 保活线程立即重连 */
     private volatile boolean reconnectNow = false;
+    /** 保活线程正在锁外建连: 对话线程先等它(wait 释放锁), 不重复建第二条 */
+    private volatile boolean warmConnecting = false;
+    private static final long WAIT_WARM_CONNECT_MS = 8_000;
     /** 保活: 最近一次收到任意帧 / 发 ping 的时间, 服务器是否回过 pong */
     private volatile long lastRxAt = 0;
     private volatile long lastPingAt = 0;
@@ -461,6 +464,16 @@ public final class GadgetClient {
     public synchronized String chatStream(String systemPrompt, String historyText,
                                           String userInput, SentenceListener listener) throws Exception {
         final int myGen = cancelGen;
+        if ((sock == null || noise == null) && warmConnecting) {
+            // 保活线程正在后台重连(打断/断网后): 等它装好, 别再并行建第二条连接
+            long t0 = System.currentTimeMillis();
+            while ((sock == null || noise == null) && warmConnecting
+                    && System.currentTimeMillis() - t0 < WAIT_WARM_CONNECT_MS && cancelGen == myGen) {
+                wait(200);
+            }
+            log("chat waited " + (System.currentTimeMillis() - t0) + " ms for background connect ("
+                    + (sock != null ? "ready" : "not ready") + ")");
+        }
         if (sock == null || noise == null) {
             connect();   // first turn / keep-alive 还没连上
         }
@@ -861,8 +874,20 @@ public final class GadgetClient {
             }
             if (need) {
                 long t0 = System.currentTimeMillis();
-                Conn c = openConn();   // 不持有对象锁: 对话线程此时可以照常用/自己建连
+                Conn c;
+                warmConnecting = true;
+                try {
+                    c = openConn();   // 不持有对象锁: 对话线程此时可以照常用/自己建连
+                } catch (Exception e) {
+                    synchronized (this) {
+                        warmConnecting = false;
+                        notifyAll();
+                    }
+                    throw e;
+                }
                 synchronized (this) {
+                    warmConnecting = false;   // 装好后才清标志, 等待中的对话线程醒来就能直接用
+                    notifyAll();
                     if (connGen != gen && sock != null) {
                         c.closeQuiet();
                         log("warm connect: chat already reconnected, drop spare connection");
