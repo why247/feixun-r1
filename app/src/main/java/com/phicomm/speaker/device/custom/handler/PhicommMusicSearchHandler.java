@@ -251,6 +251,7 @@ public class PhicommMusicSearchHandler extends SimpleUserEventInboundHandler<NLU
 
         String raw = null;
         try { raw = evt.getText(); } catch (Throwable ignored) { }
+        com.phicomm.speaker.device.custom.engine.VoiceTiming.intent("music", raw);
         if (raw != null && isNextIntent(raw) && hasQueue()) {
             new Thread(new Runnable() {
                 @Override

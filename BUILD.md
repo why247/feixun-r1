@@ -24,10 +24,10 @@ v65 / v67 出过的问题（`PhicommChatHandler.onASREventEngineInitDone` 把 `p
 git fetch
 git checkout night-opt
 git pull
-python build_from_java.py 68
+python build_from_java.py 71
 ```
 
-（`68` 是版本号，随便递增。）产物：`build_out\r1_v68.apk`。
+（`71` 是版本号，随便递增。）产物：`build_out\r1_v71.apk`。
 
 脚本做的事：
 1. `original_v2/classes.dex` → dex2jar → `tools/base.jar`（原厂类当编译 classpath，去掉 custom/）
@@ -44,14 +44,14 @@ python build_from_java.py 68
 可选让脚本直接装：
 
 ```bat
-python build_from_java.py 68 --install 192.168.10.204:5555
+python build_from_java.py 71 --install 192.168.10.204:5555
 ```
 
 或手动：
 
 ```bat
 adb connect 192.168.10.204:5555
-adb push build_out\r1_v68.apk /sdcard/r1.apk
+adb push build_out\r1_v71.apk /sdcard/r1.apk
 adb shell "CLASSPATH=/system/framework/pm.jar app_process /system/bin com.android.commands.pm.Pm install -r /sdcard/r1.apk"
 adb reboot
 ```
@@ -61,7 +61,7 @@ adb reboot
 ## 看日志
 
 ```bat
-adb logcat -d -v time -s Gadget PhicommChat OpenAIClient MusicClient PhicommMusicSearch > r1.log
+adb logcat -d -v time -s Gadget PhicommChat OpenAIClient MusicClient PhicommMusicSearch PostTeaser PersonaManager > r1.log
 ```
 
 - `MusicClient: lossless ok src=kuwo-mobi q=flac` / `src=gd-netease q=flac(1411k)` → 正在放无损

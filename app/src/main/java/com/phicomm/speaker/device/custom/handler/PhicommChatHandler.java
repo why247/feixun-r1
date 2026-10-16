@@ -457,6 +457,55 @@ public class PhicommChatHandler extends SimpleUserEventInboundHandler<NLU> {
         return Boolean.TRUE;
     }
 
+    // ================= 时间点日志(唤醒 / ASR 结束), 只记录, 不消费事件 =================
+    @Override
+    protected boolean onWakeupResult(ANTHandlerContext ctx, String result) {
+        com.phicomm.speaker.device.custom.engine.VoiceTiming.wake(result);
+        return super.onWakeupResult(ctx, result);
+    }
+
+    @Override
+    protected boolean onASREventRecordingStart(ANTHandlerContext ctx) {
+        com.phicomm.speaker.device.custom.engine.VoiceTiming.recordingStart();
+        return super.onASREventRecordingStart(ctx);
+    }
+
+    @Override
+    protected boolean onASREventSpeechEnd(ANTHandlerContext ctx) {
+        com.phicomm.speaker.device.custom.engine.VoiceTiming.speechEnd();
+        return super.onASREventSpeechEnd(ctx);
+    }
+
+    @Override
+    protected boolean onASREventRecordingStop(ANTHandlerContext ctx) {
+        com.phicomm.speaker.device.custom.engine.VoiceTiming.recordingStop();
+        return super.onASREventRecordingStop(ctx);
+    }
+
+    @Override
+    protected boolean onASREventRecognitionEnd(ANTHandlerContext ctx) {
+        com.phicomm.speaker.device.custom.engine.VoiceTiming.asrEnd("recognition");
+        return super.onASREventRecognitionEnd(ctx);
+    }
+
+    @Override
+    protected boolean onASREventNetEnd(ANTHandlerContext ctx) {
+        com.phicomm.speaker.device.custom.engine.VoiceTiming.asrEnd("net");
+        return super.onASREventNetEnd(ctx);
+    }
+
+    @Override
+    protected boolean onASREventEnd(ANTHandlerContext ctx) {
+        com.phicomm.speaker.device.custom.engine.VoiceTiming.asrEnd("end");
+        return super.onASREventEnd(ctx);
+    }
+
+    @Override
+    protected boolean onASRNluEventEnd(ANTHandlerContext ctx) {
+        com.phicomm.speaker.device.custom.engine.VoiceTiming.asrEnd("nlu");
+        return super.onASRNluEventEnd(ctx);
+    }
+
     @Override
     public boolean acceptInboundEvent0(NLU evt) {
         // 只拦截 chat 意图
@@ -554,6 +603,7 @@ public class PhicommChatHandler extends SimpleUserEventInboundHandler<NLU> {
         cancelStream("new question");
 
         final String userInput = evt.getText();
+        com.phicomm.speaker.device.custom.engine.VoiceTiming.intent("chat", userInput);
         this.lastUserInput = userInput;
         LogMgr.d(TAG, "chat intent: " + userInput + ", isIdiomGameMode=" + isIdiomGameMode);
         
