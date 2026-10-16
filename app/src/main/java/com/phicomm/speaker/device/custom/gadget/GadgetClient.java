@@ -555,8 +555,11 @@ public final class GadgetClient {
     private static final int SOFT_MAX = 40;
     /** 硬切分: 一直没有标点, 超过这么多字强制切 */
     private static final int HARD_MAX = 100;
-    /** 句末标点前的有效字数少于这个就先不切, 和下一句合并(避免「好的！」单独一次 TTS) */
+    /** 句末标点前的有效字数少于这个就先不切, 和下一句合并(避免「好的！」单独一次 TTS)。
+     *  v74: 只对第一句以后生效; 第一句(emitted==0)有句末标点且有效字≥1 就切, 短首句不再被扣留 */
     private static final int MIN_SENT = 4;
+    /** 第一句的最小有效字数(v74) */
+    private static final int MIN_FIRST_SENT = 1;
     /** 跟在句末标点后面、应归到本句的收尾符号 */
     private static final String CLOSERS = "”’」』）)】\"'。！？!?…";
 
@@ -565,7 +568,7 @@ public final class GadgetClient {
         final SentenceListener listener;
         final StringBuilder buf = new StringBuilder();   // 还没切出去的文字
         final StringBuilder all = new StringBuilder();   // 本轮全部文字
-        int emitted = 0;
+        int emitted = 0;                                 // 本轮(本 StreamState)已交给 listener 的句子数
         long startedAt = System.currentTimeMillis();
 
         StreamState(SentenceListener l) { listener = l; }
@@ -581,7 +584,8 @@ public final class GadgetClient {
                 if (c == '\n') {
                     cut = true;
                 } else if (SENT_END.indexOf(c) >= 0) {
-                    cut = contentLen(buf, i) >= MIN_SENT;
+                    // 第一句还没切出(emitted==0)时放宽: 「好的！」「嗯！」立即切出先播
+                    cut = contentLen(buf, i) >= (emitted == 0 ? MIN_FIRST_SENT : MIN_SENT);
                 } else if ((c == '，' || c == ',') && i + 1 >= SOFT_MAX) {
                     cut = true;
                 } else if (i + 1 >= HARD_MAX) {
