@@ -48,13 +48,19 @@ public class PhicommChatHandler extends SimpleUserEventInboundHandler<NLU> {
     private static final String TAG = "PhicommChat";
     private static final String LOG_FILE = "/sdcard/eav_event.log";
     
+    /** 调试用: 为 true 才把事件追加写到 /sdcard/eav_event.log(默认关, logcat 已有日志, 避免主线程文件 I/O) */
+    private static final boolean DEBUG_LOG_FILE = false;
+    /** 复用(非线程安全, writeLog 已 synchronized) */
+    private static final SimpleDateFormat LOG_TS = new SimpleDateFormat("HH:mm:ss.SSS", Locale.US);
+
     /**
-     * 写入日志到文件
+     * 写入日志到文件(DEBUG_LOG_FILE=false 时直接返回)
      */
-    private static void writeLog(String message) {
+    private static synchronized void writeLog(String message) {
+        if (!DEBUG_LOG_FILE) return;
         try {
             FileWriter fw = new FileWriter(LOG_FILE, true);
-            String timestamp = new SimpleDateFormat("HH:mm:ss.SSS", Locale.US).format(new Date());
+            String timestamp = LOG_TS.format(new Date());
             fw.append(timestamp).append(" [").append(TAG).append("] ").append(message).append("\n");
             fw.close();
         } catch (Exception e) {
