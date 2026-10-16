@@ -462,14 +462,39 @@ public class NetEaseMusicClient {
     /** 给一首候选解出可播直链; 无版权(11 秒提示音)或失败返回 null。 */
     public String kuwoResolve(MusicSearchResult c) {
         // 先试无损: 酷我车机 FLAC -> GD 台网易云 FLAC/320k; 都不行再走原来的酷我标准 MP3
-        if (losslessEnabled) {
-            try {
-                String hq = lossless.resolve(c.id, c.name, c.artist);
-                if (hq != null) return hq;
-            } catch (Throwable t) {
-                LogMgr.e(TAG, "lossless error: " + t);
-            }
+        String hq = losslessOnly(c);
+        if (hq != null) return hq;
+        return kuwoMp3Only(c);
+    }
+
+    /** kuwoResolve 的第 1 段(v76 拆出, 逻辑不变): 无损 酷我车机 FLAC -> GD 台; 关闭/失败返回 null。 */
+    public String losslessOnly(MusicSearchResult c) {
+        if (!losslessEnabled) return null;
+        try {
+            return lossless.resolve(c.id, c.name, c.artist);
+        } catch (Throwable t) {
+            LogMgr.e(TAG, "lossless error: " + t);
+            return null;
         }
+    }
+
+    /**
+     * v76 预热(后台线程): 酷我搜索/直链域名 DNS; 没有 QQ 会员(走酷我链路)时再预热 GD 台 TLS 连接。
+     * 不发任何 API 请求, 不改变回退链。
+     */
+    public void prewarm() {
+        long t0 = System.currentTimeMillis();
+        for (String h : new String[]{"search.kuwo.cn", "antiserver.kuwo.cn"}) {
+            try { java.net.InetAddress.getAllByName(h); } catch (Throwable ignored) { }
+        }
+        LogMgr.d(TAG, "warm-up: dns kuwo " + (System.currentTimeMillis() - t0) + "ms");
+        boolean qqOn = false;
+        try { qqOn = qq.available(); } catch (Throwable ignored) { }
+        if (losslessEnabled) lossless.warm(!qqOn);
+    }
+
+    /** kuwoResolve 的第 2 段(v76 拆出, 逻辑不变): 原来的酷我标准 MP3。 */
+    public String kuwoMp3Only(MusicSearchResult c) {
         String url = httpGet(KUWO_URL + c.id, 2);
         if (url == null) return null;
         url = url.trim();
@@ -594,6 +619,7 @@ public class NetEaseMusicClient {
     private String httpGetOnce(String urlStr) {
         HttpURLConnection conn = null;
         BufferedReader reader = null;
+        boolean clean = false;
 
         try {
             URL url = new URL(urlStr);
@@ -617,6 +643,7 @@ public class NetEaseMusicClient {
             while ((line = reader.readLine()) != null) {
                 response.append(line);
             }
+            clean = true;   // v76: 读到 EOF, close 后连接回池(酷我 search/antiserver 下一次免重新建连)
 
             return response.toString();
 
@@ -625,7 +652,7 @@ public class NetEaseMusicClient {
             return null;
         } finally {
             closeQuietly(reader);
-            if (conn != null) {
+            if (conn != null && !clean) {
                 try {
                     conn.disconnect();
                 } catch (Exception ignored) {}
@@ -777,6 +804,8 @@ public class NetEaseMusicClient {
         public String picUrl;     // 封面图 URL
         public MusicSearchResult cand;   // 来源候选(重新解链用), gequbao 单曲为 null
         public long resolvedAt;          // 直链解析时间(墙钟)
+        /** v76: 首曲 MP3 已可播、无损还在解析时挂在这里(播报先开始, 无损到了再换缓冲); 平时为 null */
+        public transient java.util.concurrent.Future<String> pendingHq;
 
         @Override
         public String toString() {

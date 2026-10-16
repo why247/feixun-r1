@@ -316,6 +316,7 @@ public class PhicommMusicSearchHandler extends SimpleUserEventInboundHandler<NLU
             LogMgr.e(TAG, "QQMusicClient init failed: " + t);
         }
         tuneVadBackSil();
+        prewarmAsync("boot");
         return super.onASREventEngineInitDone(ctx);
     }
     
@@ -370,6 +371,7 @@ public class PhicommMusicSearchHandler extends SimpleUserEventInboundHandler<NLU
         final int sg = ++searchGen;
         intentAt = System.currentTimeMillis();
         firstStartLogged = false;
+        prewarmAsync("intent");   // v76: 与搜索并行做 DNS / GD 台 TLS 预热, 首曲解析直接复用连接
         runMusicTask(new Runnable() {
             @Override
             public void run() {
@@ -497,6 +499,21 @@ public class PhicommMusicSearchHandler extends SimpleUserEventInboundHandler<NLU
         ctx.stopWakeup();
         ctx.stopASR();
         MusicPrefetcher.prepare(result.playUrl, "music_search");
+        final java.util.concurrent.Future<String> hq = result.pendingHq;
+        result.pendingHq = null;
+        if (hq != null) {
+            // v76: 曲目已确定(MP3 可播), 先播报; MP3 先缓冲兜底, 无损到了换缓冲(onHqDecided)
+            final MusicPlayResult r = result;
+            final ANTHandlerContext c = ctx;
+            mainHandler.post(new Runnable() {
+                @Override
+                public void run() {
+                    hqPending = r;
+                    hqTtsEnded = false;
+                }
+            });
+            startHqWaiter(c, r, hq, sg);
+        }
         String ttsText = announceText(result.name, result.artist);
         LogMgr.d(TAG, "announce: " + ttsText);
         ctx.playTTS(ttsText);
@@ -573,6 +590,15 @@ public class PhicommMusicSearchHandler extends SimpleUserEventInboundHandler<NLU
                     }
                 }
                 NetEaseMusicClient.MusicSearchResult c = cands.get(i);
+                if (i >= par && !"qq".equals(c.source)) {
+                    // v76: 酷我候选: 无损与 MP3 并行(选用顺序不变), MP3 先好就先播报
+                    MusicPlayResult r = resolveKuwoParallel(c, sg);
+                    if (r != null) {
+                        picked[0] = i;
+                        return r;
+                    }
+                    continue;
+                }
                 String url = i < par ? musicClient.qqMissKuwoChain(c) : musicClient.resolve(c);
                 if (url != null) {
                     picked[0] = i;
@@ -582,6 +608,151 @@ public class PhicommMusicSearchHandler extends SimpleUserEventInboundHandler<NLU
             return null;
         } finally {
             for (java.util.concurrent.Future<String> f : fs) f.cancel(false);
+        }
+    }
+
+    /** v76: 后台预热(DNS + GD 台 TLS 连接进池), 不发 API 请求, 失败无影响。 */
+    private void prewarmAsync(final String why) {
+        try {
+            RESOLVE_POOL.submit(new Runnable() {
+                @Override
+                public void run() {
+                    long t0 = System.currentTimeMillis();
+                    try {
+                        musicClient.prewarm();
+                    } catch (Throwable t) {
+                        LogMgr.d(TAG, "prewarm (" + why + ") error: " + t);
+                    }
+                    LogMgr.d(TAG, "timing: prewarm (" + why + ") done in " + (System.currentTimeMillis() - t0) + "ms");
+                }
+            });
+        } catch (Throwable ignored) { }
+    }
+
+    /** 等 future 完成(每 40ms 看一次是否被打断), 返回直链或 null。 */
+    private String waitUrl(java.util.concurrent.Future<String> f, int sg) {
+        while (!f.isDone()) {
+            if (sg != searchGen) return null;
+            try { Thread.sleep(40); } catch (InterruptedException e) { return null; }
+        }
+        return futureUrl(f);
+    }
+
+    /** 无损先到时, 在 MP3 已可播之后再给它这么久(省一次「先缓冲 MP3 再换无损」) */
+    private static final long HQ_GRACE_MS = 300;
+    /** 播报已开始、等无损的上限(无损两跳各自超时 5s 连接 + 8s 读, 正常远小于此), 超过用 MP3 */
+    private static final long HQ_WAIT_MAX_MS = 30000;
+
+    /**
+     * v76 首曲(非 QQ 候选)并行解析: 原来 kuwoResolve 串行「无损(车机FLAC→GD) → 酷我 MP3」, 现在两段同时发,
+     * 选用顺序不变: 无损拿到就用无损; 无损落空才用 MP3; MP3 落空只看无损。
+     * MP3 先到而无损仍在路上: 返回 MP3 结果并挂 pendingHq —— 这首歌已确定能播(播报的就是实际曲名),
+     * 调用方先播报, 无损到了再把缓冲换成无损(deliverResult/onHqDecided)。
+     */
+    private MusicPlayResult resolveKuwoParallel(final NetEaseMusicClient.MusicSearchResult c, int sg) {
+        if (!NetEaseMusicClient.losslessEnabled) {
+            String u = musicClient.resolve(c);
+            return u == null ? null : NetEaseMusicClient.toPlay(c, u);
+        }
+        long t0 = System.currentTimeMillis();
+        java.util.concurrent.Future<String> hq = RESOLVE_POOL.submit(new java.util.concurrent.Callable<String>() {
+            @Override
+            public String call() {
+                return musicClient.losslessOnly(c);
+            }
+        });
+        java.util.concurrent.Future<String> mp3 = RESOLVE_POOL.submit(new java.util.concurrent.Callable<String>() {
+            @Override
+            public String call() {
+                return musicClient.kuwoMp3Only(c);
+            }
+        });
+        long mp3OkAt = 0;
+        while (true) {
+            if (sg != searchGen) { hq.cancel(false); mp3.cancel(false); return null; }
+            long now = System.currentTimeMillis();
+            if (hq.isDone()) {
+                String u = futureUrl(hq);
+                if (u != null) {
+                    mp3.cancel(false);
+                    LogMgr.d(TAG, "first track: lossless ok in " + (now - t0) + "ms (parallel with mp3)");
+                    return NetEaseMusicClient.toPlay(c, u);
+                }
+                String m = waitUrl(mp3, sg);
+                LogMgr.d(TAG, "first track: lossless miss, mp3 " + (m != null ? "ok" : "miss") + " in "
+                        + (System.currentTimeMillis() - t0) + "ms");
+                return m == null ? null : NetEaseMusicClient.toPlay(c, m);
+            }
+            if (mp3.isDone()) {
+                String m = futureUrl(mp3);
+                if (m == null) {
+                    String u = waitUrl(hq, sg);
+                    LogMgr.d(TAG, "first track: mp3 miss, lossless " + (u != null ? "ok" : "miss") + " in "
+                            + (System.currentTimeMillis() - t0) + "ms");
+                    return u == null ? null : NetEaseMusicClient.toPlay(c, u);
+                }
+                if (mp3OkAt == 0) mp3OkAt = now;
+                if (now - mp3OkAt >= HQ_GRACE_MS) {
+                    MusicPlayResult r = NetEaseMusicClient.toPlay(c, m);
+                    r.pendingHq = hq;
+                    LogMgr.d(TAG, "first track: mp3 ready in " + (mp3OkAt - t0) + "ms, lossless pending -> announce early");
+                    return r;
+                }
+            }
+            try { Thread.sleep(40); } catch (InterruptedException e) { return null; }
+        }
+    }
+
+    /** v76: 已播报、等无损决定的那首(主线程读写) */
+    private MusicPlayResult hqPending;
+    /** v76: 等无损期间 TTS 已结束(决定一到立即开播) */
+    private boolean hqTtsEnded = false;
+
+    /** 后台等无损结果, 回主线程决定用无损还是 MP3。 */
+    private void startHqWaiter(final ANTHandlerContext ctx, final MusicPlayResult result,
+                               final java.util.concurrent.Future<String> hq, final int sg) {
+        runMusicTask(new Runnable() {
+            @Override
+            public void run() {
+                long deadline = System.currentTimeMillis() + HQ_WAIT_MAX_MS;
+                while (!hq.isDone() && sg == searchGen && System.currentTimeMillis() < deadline) {
+                    try { Thread.sleep(40); } catch (InterruptedException e) { break; }
+                }
+                final boolean timedOut = !hq.isDone();
+                final String u = futureUrl(hq);
+                mainHandler.post(new Runnable() {
+                    @Override
+                    public void run() {
+                        onHqDecided(ctx, result, u, timedOut, sg);
+                    }
+                });
+            }
+        });
+    }
+
+    /** 主线程: 无损到了就把缓冲换成无损, 否则保持 MP3; TTS 已结束则立即开播。 */
+    private void onHqDecided(ANTHandlerContext ctx, MusicPlayResult result, String hqUrl, boolean timedOut, int sg) {
+        if (hqPending != result) return;
+        hqPending = null;
+        boolean ttsEnded = hqTtsEnded;
+        hqTtsEnded = false;
+        long since = System.currentTimeMillis() - intentAt;
+        if (sg != searchGen || currentResult != result) {
+            LogMgr.d(TAG, "lossless decision dropped (interrupted/superseded)");
+            return;
+        }
+        if (hqUrl != null) {
+            result.playUrl = hqUrl;
+            result.resolvedAt = System.currentTimeMillis();
+            LogMgr.d(TAG, "timing: lossless ready " + since + "ms after intent -> switch buffer to lossless"
+                    + (ttsEnded ? " (TTS already ended)" : " (during TTS)"));
+            MusicPrefetcher.prepare(hqUrl, "music_search");
+        } else {
+            LogMgr.d(TAG, "timing: lossless " + (timedOut ? "timeout" : "miss") + " " + since
+                    + "ms after intent -> keep mp3");
+        }
+        if (ttsEnded && currentResult != null && currentResult.playUrl != null) {
+            playMusic(ctx, new ArrayList<MusicItem>());
         }
     }
 
@@ -650,6 +821,13 @@ public class PhicommMusicSearchHandler extends SimpleUserEventInboundHandler<NLU
             return true;
         }
 
+        // v76: 首曲已播报但无损还在解析: 等决定(MP3 已在缓冲兜底), 决定一到 onHqDecided 立即开播
+        if (hqPending != null && hqPending == currentResult) {
+            hqTtsEnded = true;
+            LogMgr.d(TAG, "TTS end, lossless still resolving -> wait (mp3 buffered as fallback)");
+            return true;
+        }
+
         // TTS 播报结束后，开始播放音乐
         if (currentResult != null && currentResult.playUrl != null) {
             List<MusicItem> musicList = new ArrayList<>();
@@ -664,6 +842,8 @@ public class PhicommMusicSearchHandler extends SimpleUserEventInboundHandler<NLU
     public void doInterrupt(ANTHandlerContext ctx, String interruptType) {
         if (this.eventReceived) {
             searchGen++;   // 在途的点歌结果作废(不再播报/开播)
+            hqPending = null;
+            hqTtsEnded = false;
             ctx.cancelTTS();
             
             // 停止音乐播放（如果实现了）

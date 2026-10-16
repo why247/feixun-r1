@@ -40,6 +40,12 @@ public class LosslessResolver {
         "http://mobi.kuwo.cn/mobi.s?f=web&source=kwplayercar_ar_6.0.0.9_B_jiakong_vh.apk"
         + "&from=PC&type=convert_url_with_sign&br=flac&user=C_APK_guanwang_";
     private static final String GD_API = "https://music-api.gdstudio.xyz/api.php";
+    /** v76 预热用: 根路径只回一个 162 字节的 301(不是 api.php, 不占 GD 台 50 次/5 分钟的额度) */
+    private static final String GD_ROOT = "https://music-api.gdstudio.xyz/";
+    private static final long WARM_MIN_INTERVAL_MS = 60 * 1000L;
+    private volatile long lastGdNetAt = 0;
+    /** 严格证书校验失败过一次就直接走放宽连接, 不再每次先做一次注定失败的握手(放宽策略本身不变) */
+    private volatile boolean gdRelaxedFirst = false;
     /** 不能用 curl 一类的 UA, 否则 Cloudflare 会弹人机验证 */
     private static final String UA = "Mozilla/5.0 (Linux; U; Android 5.1.1; Phicomm R1) AppleWebKit/537.36";
 
@@ -144,7 +150,9 @@ public class LosslessResolver {
             return null;
         }
         String q = name + (artist == null || artist.isEmpty() ? "" : " " + firstArtist(artist));
+        long ts = System.currentTimeMillis();
         String body = get(GD_API + "?types=search&source=netease&count=8&name=" + enc(q), true);
+        LogMgr.d(TAG, "gd timing: search " + (System.currentTimeMillis() - ts) + "ms" + (body == null ? " (fail)" : ""));
         if (body == null) return null;
         String id = null;
         try {
@@ -159,7 +167,9 @@ public class LosslessResolver {
             return null;
         }
         // br=740 拿 16bit FLAC; 不用 999(可能是 24bit Hi-Res, 5.1 解码/带宽没必要)
+        long tu = System.currentTimeMillis();
         body = get(GD_API + "?types=url&source=netease&br=740&id=" + id, true);
+        LogMgr.d(TAG, "gd timing: url " + (System.currentTimeMillis() - tu) + "ms" + (body == null ? " (fail)" : ""));
         if (body == null) return null;
         try {
             JSONObject o = new JSONObject(body);
@@ -242,11 +252,84 @@ public class LosslessResolver {
         }
     }
 
+    /**
+     * v76 预热(点歌意图到达时与搜索并行 / 开机): GD 台做一次 TLS 握手并把连接留在 HttpURLConnection 连接池,
+     * 紧接着的 GD search/url 复用它; 酷我车机域名只做 DNS 解析。60 秒内用过 GD 就跳过。只在后台线程调用。
+     */
+    public void warm(boolean gd) {
+        long t0 = System.currentTimeMillis();
+        String gdRes = "skip";
+        if (gd && t0 - lastGdNetAt > WARM_MIN_INTERVAL_MS) {
+            lastGdNetAt = t0;
+            HttpURLConnection conn = null;
+            boolean clean = false;
+            try {
+                conn = (HttpURLConnection) new URL(GD_ROOT).openConnection();
+                if (gdRelaxedFirst && conn instanceof HttpsURLConnection) relax((HttpsURLConnection) conn);
+                conn.setInstanceFollowRedirects(false);
+                conn.setRequestProperty("User-Agent", UA);
+                conn.setConnectTimeout(CONNECT_TIMEOUT);
+                conn.setReadTimeout(READ_TIMEOUT);
+                int code = conn.getResponseCode();
+                InputStream in = code >= 400 ? conn.getErrorStream() : conn.getInputStream();
+                if (in != null) {
+                    byte[] b = new byte[2048];
+                    int total = 0, r;
+                    while ((r = in.read(b)) > 0) {
+                        total += r;
+                        if (total > 64 * 1024) break;
+                    }
+                    clean = total <= 64 * 1024;
+                    in.close();
+                }
+                gdRes = "http " + code + " " + (System.currentTimeMillis() - t0) + "ms";
+            } catch (SSLException e) {
+                gdRelaxedFirst = true;
+                gdRes = "ssl fail (next gd request goes relaxed directly)";
+            } catch (Throwable e) {
+                gdRes = "fail " + e.getClass().getSimpleName();
+            } finally {
+                if (conn != null && !clean) conn.disconnect();
+            }
+        }
+        long t1 = System.currentTimeMillis();
+        String dns;
+        try {
+            java.net.InetAddress.getAllByName("mobi.kuwo.cn");
+            dns = (System.currentTimeMillis() - t1) + "ms";
+        } catch (Throwable e) {
+            dns = "fail";
+        }
+        LogMgr.d(TAG, "warm-up: gd " + gdRes + ", dns mobi.kuwo.cn " + dns);
+    }
+
+    private static void relax(HttpsURLConnection hc) throws Exception {
+        hc.setSSLSocketFactory(relaxedContext().getSocketFactory());
+        hc.setHostnameVerifier(RELAXED_HV);
+    }
+
+    /** 单例: 连接池按 SSLSocketFactory/HostnameVerifier 实例区分, 每次 new 会让放宽连接无法复用 */
+    private static final HostnameVerifier RELAXED_HV = new HostnameVerifier() {
+        @Override
+        public boolean verify(String h, SSLSession s) {
+            return h != null && h.endsWith("gdstudio.xyz");
+        }
+    };
+
     private String get(String urlStr, boolean allowInsecureRetry) {
+        if (allowInsecureRetry && gdRelaxedFirst) {
+            try {
+                return getOnce(urlStr, true);
+            } catch (Exception e2) {
+                LogMgr.d(TAG, "get failed: " + e2);
+                return null;
+            }
+        }
         try {
             return getOnce(urlStr, false);
         } catch (SSLException e) {
             if (!allowInsecureRetry) return null;
+            gdRelaxedFirst = true;
             // Android 5.1 信任库老; 这里只拿一个公开的播放直链, 不带任何凭证, 证书验不过就放宽重试一次
             LogMgr.d(TAG, "ssl failed (" + e.getMessage() + "), retry relaxed");
             try {
@@ -263,16 +346,11 @@ public class LosslessResolver {
 
     private String getOnce(String urlStr, boolean relaxed) throws Exception {
         HttpURLConnection conn = (HttpURLConnection) new URL(urlStr).openConnection();
+        boolean clean = false;   // v76: 响应体读到 EOF 并 close → 不 disconnect, 连接回池给下一次请求复用
+        if (urlStr.startsWith(GD_ROOT)) lastGdNetAt = System.currentTimeMillis();
         try {
             if (relaxed && conn instanceof HttpsURLConnection) {
-                HttpsURLConnection hc = (HttpsURLConnection) conn;
-                hc.setSSLSocketFactory(relaxedContext().getSocketFactory());
-                hc.setHostnameVerifier(new HostnameVerifier() {
-                    @Override
-                    public boolean verify(String h, SSLSession s) {
-                        return h != null && h.endsWith("gdstudio.xyz");
-                    }
-                });
+                relax((HttpsURLConnection) conn);
             }
             conn.setRequestProperty("User-Agent", UA);
             conn.setRequestProperty("Accept", "application/json,*/*");
@@ -287,14 +365,16 @@ public class LosslessResolver {
             ByteArrayOutputStream bos = new ByteArrayOutputStream();
             byte[] buf = new byte[4096];
             int n;
+            boolean eof = true;
             while ((n = in.read(buf)) > 0) {
                 bos.write(buf, 0, n);
-                if (bos.size() > 256 * 1024) break;
+                if (bos.size() > 256 * 1024) { eof = false; break; }
             }
             in.close();
+            clean = eof;
             return bos.toString("UTF-8");
         } finally {
-            conn.disconnect();
+            if (!clean) conn.disconnect();
         }
     }
 
